@@ -1,11 +1,20 @@
+import os
 import pandas as pd
 import logging
 import sys
 from pathlib import Path
 
+# Evita UnicodeEncodeError no print (Windows/cp1252) com emojis nos logs
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # Configuração para o Python encontrar as nossas pastas 'src'
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-sys.path.append(str(BASE_DIR))
+sys.path.insert(0, str(BASE_DIR))
 
 from src.etl.extract import extrair_dados_brutos
 from src.api.pubchem import buscar_dados_pubchem
@@ -72,7 +81,7 @@ def enriquecer_dados_laboratorio(df_bruto: pd.DataFrame) -> pd.DataFrame:
                 linha_enriquecida['chebi_id'] = resultado_chebi['chebi_id']
                 linha_enriquecida['classe_quimica'] = resultado_chebi['classes_ontologicas']
                 
-        # Adiciona a linha pronta à nossa lista final
+        # Adiciona a linha pronta à nossa lista final"
         dados_enriquecidos.append(linha_enriquecida)
         
     logger.info("✅ Transformação concluída com sucesso!")
@@ -82,10 +91,12 @@ def enriquecer_dados_laboratorio(df_bruto: pd.DataFrame) -> pd.DataFrame:
     return df_final
 
 if __name__ == "__main__":
-    # Caminhos dos arquivos brutos
-    RAW_DIR = BASE_DIR / 'data' / 'raw'
-    ARQUIVO_IDENT = RAW_DIR / "IDENTIFICACAO.xlsx"
-    ARQUIVO_ABUND = RAW_DIR / "ABUND.xlsx"
+    # Caminhos dos arquivos brutos (mesmas variáveis que em extract.py)
+    RAW_DIR = BASE_DIR / "data" / "raw"
+    nome_ident = os.environ.get("OMICS_IDENT_FILE", "IDENTIFICACAO.xlsx")
+    nome_abund = os.environ.get("OMICS_ABUND_FILE", "ABUND.xlsx")
+    ARQUIVO_IDENT = RAW_DIR / nome_ident
+    ARQUIVO_ABUND = RAW_DIR / nome_abund
     
     # 1. EXTRAIR
     df_bruto = extrair_dados_brutos(ARQUIVO_IDENT, ARQUIVO_ABUND)
@@ -94,5 +105,5 @@ if __name__ == "__main__":
         # 2. TRANSFORMAR E ENRIQUECER
         df_pronto_para_banco = enriquecer_dados_laboratorio(df_bruto)
         
-        print("\n📊 VISUALIZAÇÃO DO DATAFRAME FINAL (Pronto para o PostgreSQL/SQLite):")
+        print("\n[VISUALIZACAO] DataFrame final (pronto para SQLite/PostgreSQL):")
         print(df_pronto_para_banco.to_string())
