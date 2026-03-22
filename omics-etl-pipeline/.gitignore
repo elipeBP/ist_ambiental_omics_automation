@@ -1,0 +1,19 @@
+# Dados locais e artefatos gerados
+data/
+banco_ist.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.venv/
+venv/
+env/
+
+# Ambiente / IDE
+.env
+.env.*
+.idea/
+.vscode/
