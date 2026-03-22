@@ -1,9 +1,11 @@
 import sqlite3
-import os
+import sys
+from pathlib import Path
 
-# Caminho absoluto para o arquivo do banco de dados na raiz do projeto
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-DB_PATH = os.path.join(BASE_DIR, 'banco_ist.db')
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(BASE_DIR))
+
+from src.database.connection import DB_PATH
 
 def criar_tabelas():
     """
@@ -40,10 +42,10 @@ def criar_tabelas():
         
         # Salva as alterações (Commit)
         conn.commit()
-        print("✅ Tabela 'compostos_identificados' criada ou verificada com sucesso!")
+        print("OK: Tabela 'compostos_identificados' criada ou verificada com sucesso.")
         
     except sqlite3.Error as erro:
-        print(f"❌ Erro de banco de dados: {erro}")
+        print(f"Erro de banco de dados: {erro}")
         
     finally:
         # Sempre fechar a conexão no final
