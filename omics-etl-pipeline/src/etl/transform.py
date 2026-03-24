@@ -40,7 +40,7 @@ def enriquecer_dados_laboratorio(df_bruto: pd.DataFrame) -> pd.DataFrame:
     
     # Vamos processar apenas as primeiras 3 moléculas para teste (para não esperar muito tempo agora)
     # No pipeline real, tiramos esse [:3]
-    df_teste = df_bruto.head(3)
+    df_teste = df_bruto.iloc[1000:1010]
     
     for index, row in df_teste.iterrows():
         nome_molecula = str(row.get('Description')).strip()

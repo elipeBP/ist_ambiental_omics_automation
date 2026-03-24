@@ -7,79 +7,69 @@ sys.path.insert(0, str(BASE_DIR))
 
 from src.database.connection import DB_PATH
 
-# DDL atual: o mesmo código do equipamento pode repetir-se com descrições diferentes (merge abundância).
-SQL_TABELA_COMPOSTOS = """
-    CREATE TABLE IF NOT EXISTS compostos_identificados (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        compound_code TEXT NOT NULL,
-        description TEXT,
-        mz REAL,
-        retention_time REAL,
-        formula TEXT,
-        pubchem_cid TEXT,
-        chebi_id TEXT,
-        classe_quimica TEXT,
-        via_metabolica TEXT,
-        data_insercao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """
+# 1. Tabela de Dimensão (Guarda apenas os metadados da molécula e APIs)
+SQL_CRIAR_DIMENSAO = """
+CREATE TABLE IF NOT EXISTS dim_composto (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    compound_code TEXT NOT NULL,
+    description TEXT,
+    formula TEXT,
+    pubchem_cid TEXT,
+    chebi_id TEXT,
+    classe_quimica TEXT,
+    via_metabolica TEXT,
+    data_insercao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(compound_code, description) -- Garante que não duplicamos moléculas idênticas
+);
+"""
 
+# 2. Tabela de Factos (Guarda a telemetria do equipamento ligada à Dimensão)
+SQL_CRIAR_FATO = """
+CREATE TABLE IF NOT EXISTS fact_abundancia (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dim_composto_id INTEGER,
+    mz REAL,
+    retention_time REAL,
+    data_insercao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (dim_composto_id) REFERENCES dim_composto (id)
+);
+"""
 
-def _migrate_remover_unique_compound_code(conn: sqlite3.Connection) -> None:
-    """Se a tabela foi criada com compound_code UNIQUE, recria sem essa restrição (preserva dados)."""
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='compostos_identificados'"
-    ).fetchone()
-    if not row or not row[0]:
-        return
-    ddl = row[0]
-    # Schema antigo: UNIQUE em compound_code (impedia várias linhas com o mesmo código)
-    if "compound_code TEXT UNIQUE" not in ddl and "compound_code TEXT NOT NULL UNIQUE" not in ddl:
-        return
+# 3. Índice para acelerar as buscas exigido na Aula 5
+SQL_CRIAR_INDICE = """
+CREATE INDEX IF NOT EXISTS idx_compound_code ON dim_composto (compound_code);
+"""
 
-    cur = conn.cursor()
-    cur.execute("ALTER TABLE compostos_identificados RENAME TO compostos_identificados_old")
-    cur.executescript(SQL_TABELA_COMPOSTOS)
-    cur.execute(
-        """
-        INSERT INTO compostos_identificados (
-            id, compound_code, description, mz, retention_time, formula,
-            pubchem_cid, chebi_id, classe_quimica, via_metabolica, data_insercao
-        )
-        SELECT
-            id, compound_code, description, mz, retention_time, formula,
-            pubchem_cid, chebi_id, classe_quimica, via_metabolica, data_insercao
-        FROM compostos_identificados_old
-        """
-    )
-    cur.execute("DROP TABLE compostos_identificados_old")
-    conn.commit()
-    print("OK: Migração aplicada — removido UNIQUE de compound_code (várias linhas por código).")
-
+# 4. View de Enriquecimento exigida na Aula 5 (Analito | Massa | Usos)
+SQL_CRIAR_VIEW = """
+CREATE VIEW IF NOT EXISTS vw_enriquecimento_mol_usos AS
+SELECT 
+    d.description AS "Nome do Analito (IST)", 
+    f.mz AS "Massa Molecular", 
+    d.classe_quimica AS "Usos Conhecidos (API)"
+FROM dim_composto d
+JOIN fact_abundancia f ON d.id = f.dim_composto_id;
+"""
 
 def criar_tabelas():
-    """
-    Conecta ao banco SQLite e cria/atualiza o schema.
-    """
-    print("Iniciando a criação do Schema do Banco de Dados...")
-
+    print("Iniciando a criação do Schema Dimensional (Facto/Dimensão)...")
     conn = sqlite3.connect(DB_PATH)
+    
+    # Habilitar o uso de chaves estrangeiras (Foreign Keys) no SQLite
+    conn.execute("PRAGMA foreign_keys = ON;")
+    
     try:
-        existe = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='compostos_identificados'"
-        ).fetchone()
-        if existe:
-            _migrate_remover_unique_compound_code(conn)
-
-        conn.execute(SQL_TABELA_COMPOSTOS)
+        cur = conn.cursor()
+        cur.execute(SQL_CRIAR_DIMENSAO)
+        cur.execute(SQL_CRIAR_FATO)
+        cur.execute(SQL_CRIAR_INDICE)
+        cur.execute(SQL_CRIAR_VIEW)
         conn.commit()
-        print("OK: Tabela 'compostos_identificados' criada ou verificada com sucesso.")
+        print("✅ Schema dimensional, Índice e View criados com sucesso!")
     except sqlite3.Error as erro:
-        print(f"Erro de banco de dados: {erro}")
+        print(f"❌ Erro de base de dados: {erro}")
     finally:
         conn.close()
-        print("Conexão com o banco encerrada.")
-
 
 if __name__ == "__main__":
     criar_tabelas()
