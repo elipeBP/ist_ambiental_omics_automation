@@ -12,6 +12,7 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 # Importando as nossas funções dos módulos ETL
+from src.database.schema import criar_tabelas
 from src.etl.extract import extrair_dados_brutos
 from src.etl.transform import enriquecer_dados_laboratorio
 from src.etl.load import carregar_dados_no_banco
@@ -29,6 +30,9 @@ def executar_pipeline():
     Função principal que orquestra todo o processo de Engenharia de Dados.
     """
     logger.info("🚀 Iniciando o pipeline Omics ETL completo...")
+
+    # 0. Garantir que o schema do banco existe antes de qualquer operação
+    criar_tabelas()
 
     # 1. Definição dinâmica dos caminhos dos arquivos
     BASE_DIR = Path(__file__).resolve().parent
