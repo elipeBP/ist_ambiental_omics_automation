@@ -11,6 +11,36 @@ from src.database.connection import DB_PATH
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Tabela 0 — Controle de execuções do pipeline (rastreabilidade / auditoria)
+#   Uma linha por invocação. hash_ident+hash_abund previne reprocessamento.
+# ---------------------------------------------------------------------------
+SQL_BATCH_EXECUCAO = """
+CREATE TABLE IF NOT EXISTS batch_execucao (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    status              TEXT NOT NULL DEFAULT 'pendente'
+                            CHECK(status IN ('pendente','executando','sucesso','falha')),
+    fonte               TEXT NOT NULL,
+    nome_ident          TEXT NOT NULL,
+    nome_abund          TEXT NOT NULL,
+    hash_ident          TEXT NOT NULL,
+    hash_abund          TEXT NOT NULL,
+    iniciado_em         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    concluido_em        TIMESTAMP,
+    total_sinais        INTEGER,
+    total_candidatos    INTEGER,
+    total_moleculas_api INTEGER,
+    erro_mensagem       TEXT
+    -- Sem UNIQUE no par de hashes: a regra "não reprocessar sucesso" é
+    -- aplicada no código (registrar_batch). Isso permite retentar após falha.
+);
+"""
+
+SQL_INDICE_BATCH_STATUS = """
+CREATE INDEX IF NOT EXISTS idx_batch_status
+    ON batch_execucao (status, iniciado_em DESC);
+"""
+
+# ---------------------------------------------------------------------------
 # Tabela 1 — Sinal analítico bruto do equipamento
 # ---------------------------------------------------------------------------
 SQL_FACT_SINAL = """
@@ -169,6 +199,8 @@ def criar_tabelas() -> None:
         cur = conn.cursor()
 
         # Tabelas base (idempotentes)
+        cur.execute(SQL_BATCH_EXECUCAO)
+        cur.execute(SQL_INDICE_BATCH_STATUS)
         cur.execute(SQL_FACT_SINAL)
         cur.execute(SQL_DIM_MOLECULA)
         cur.execute(SQL_CANDIDATO_SINAL)
@@ -184,7 +216,8 @@ def criar_tabelas() -> None:
 
         conn.commit()
         logger.info(
-            "Schema OK: fact_sinal | dim_molecula | candidato_sinal | vw_ranking_candidatos"
+            "Schema OK: batch_execucao | fact_sinal | dim_molecula "
+            "| candidato_sinal | vw_ranking_candidatos"
         )
     except sqlite3.Error as e:
         logger.error(f"Erro ao criar schema: {e}")
