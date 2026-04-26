@@ -137,30 +137,53 @@ if sinal_escolhido != opcao_todos:
             score_melhor = melhor.iloc[0]["Score Total"]
             st.success(f"**Candidato mais plausível (Rank 1):** {nome_melhor} — Score: {score_melhor:.2f}")
 
-        # Tabela completa com todos os candidatos do sinal
+        # --- Dados laboratoriais (do equipamento) ---
+        st.markdown("**Dados laboratoriais**")
+        colunas_lab = [
+            "Candidato", "Adducts", "Neutral Mass (Da)",
+            "Score Lab", "Score Fragmentacao", "Mass Error (ppm)", "Isotope Similarity",
+            "Rank",
+        ]
+        colunas_lab_presentes = [c for c in colunas_lab if c in df_detalhe.columns]
         st.dataframe(
-            df_detalhe,
+            df_detalhe[colunas_lab_presentes],
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Score Total": st.column_config.ProgressColumn(
-                    "Score Total",
-                    min_value=0,
-                    max_value=70,
-                    format="%.2f",
-                ),
-                "Score Massa": st.column_config.NumberColumn("Score Massa", format="%.2f"),
-                "Score Metadata": st.column_config.NumberColumn("Score Metadata", format="%.2f"),
-                "Rank": st.column_config.NumberColumn("Rank"),
+                "Score Lab":          st.column_config.NumberColumn("Score Lab",          format="%.1f"),
+                "Score Fragmentacao": st.column_config.NumberColumn("Score Fragmentacao", format="%.1f"),
+                "Mass Error (ppm)":   st.column_config.NumberColumn("Mass Error (ppm)",   format="%.4f"),
+                "Isotope Similarity": st.column_config.NumberColumn("Isotope Similarity", format="%.2f"),
+                "Neutral Mass (Da)":  st.column_config.NumberColumn("Neutral Mass (Da)",  format="%.4f"),
+                "Rank":               st.column_config.NumberColumn("Rank"),
             },
         )
 
-        # Gráfico de scores por candidato (útil quando há múltiplos candidatos)
+        # --- Scores internos do pipeline ---
+        st.markdown("**Scores internos do pipeline** *(fórmula provisória — aguarda validação IST)*")
+        colunas_score = ["Candidato", "Score Massa", "Score Metadata", "Score Total", "Rank"]
+        colunas_score_presentes = [c for c in colunas_score if c in df_detalhe.columns]
+        st.dataframe(
+            df_detalhe[colunas_score_presentes],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Score Total":    st.column_config.ProgressColumn("Score Total",    min_value=0, max_value=70, format="%.2f"),
+                "Score Massa":    st.column_config.NumberColumn("Score Massa",    format="%.2f"),
+                "Score Metadata": st.column_config.NumberColumn("Score Metadata", format="%.2f"),
+                "Rank":           st.column_config.NumberColumn("Rank"),
+            },
+        )
+
+        # Gráfico comparativo (aparece só com múltiplos candidatos)
         if len(df_detalhe) > 1:
-            st.bar_chart(
-                df_detalhe.set_index("Candidato")[["Score Massa", "Score Metadata"]],
-                use_container_width=True,
-            )
+            cols_grafico = [c for c in ["Score Lab", "Score Fragmentacao", "Isotope Similarity"] if c in df_detalhe.columns]
+            if cols_grafico:
+                st.markdown("**Comparativo visual — scores laboratoriais**")
+                st.bar_chart(
+                    df_detalhe.set_index("Candidato")[cols_grafico],
+                    use_container_width=True,
+                )
 
 # ---------------------------------------------------------------------------
 # Rodapé
