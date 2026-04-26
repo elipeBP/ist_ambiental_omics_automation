@@ -1,4 +1,0 @@
-{
-  "python.defaultInterpreterPath": "${workspaceFolder}/omics-etl-pipeline/.venv/Scripts/python.exe",
-  "python.analysis.extraPaths": ["${workspaceFolder}/omics-etl-pipeline"]
-}
