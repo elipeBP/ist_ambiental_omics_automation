@@ -31,6 +31,7 @@ def _normalizar_colunas_apos_merge(df: pd.DataFrame) -> pd.DataFrame:
     """
     out = df.copy()
 
+    # m/z e Retention time: prefere _y (ABUND — valor medido do equipamento)
     for base in ("m/z", "Retention time (min)"):
         if base in out.columns:
             continue
@@ -42,6 +43,16 @@ def _normalizar_colunas_apos_merge(df: pd.DataFrame) -> pd.DataFrame:
 
     if "Description" not in out.columns and "Description_x" in out.columns:
         out["Description"] = out["Description_x"]
+
+    # Neutral mass (Da): existe em ambos os arquivos após merge.
+    # Prefere _x (IDENTIFICACAO) — é a massa neutra teórica por candidato,
+    # já com correção de aducto aplicada pelo software do equipamento.
+    if "Neutral mass (Da)" not in out.columns:
+        for suf in ("_x", "_y"):
+            alt = f"Neutral mass (Da){suf}"
+            if alt in out.columns:
+                out["Neutral mass (Da)"] = out[alt]
+                break
 
     drop_candidates = [
         c
