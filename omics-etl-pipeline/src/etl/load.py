@@ -16,34 +16,74 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Parâmetros do scoring interno
 # (fórmula de score_total a validar com IST antes de tornar definitiva)
+#
+# Thresholds de ppm baseados em boas práticas de HRMS (Q-TOF / Orbitrap).
+# Instrumentos modernos de alta resolução operam tipicamente a 1–5 ppm.
+# Estes valores são defaults defensáveis — podem ser calibrados pelo IST
+# conforme o equipamento utilizado (ex.: 2 ppm para Orbitrap, 10 ppm para Q-TOF).
 # ---------------------------------------------------------------------------
-TOLERANCIA_MAXIMA = 0.5    # desvio ≤ 0.5 Da → score_massa = 40
-TOLERANCIA_ZERO   = 5.0    # desvio ≥ 5.0 Da → score_massa = 0
+TOLERANCIA_PPM_MAX  = 5.0   # ≤  5 ppm → score_massa = 40 (match excelente)
+TOLERANCIA_PPM_ZERO = 20.0  # ≥ 20 ppm → score_massa = 0  (match descartado)
 
 PONTOS_POR_METADADO = 6
 CAMPOS_METADADO = ["formula", "pubchem_cid", "chebi_id", "classe_quimica", "peso_molecular"]
+
+
+def _score_massa_ppm(row: pd.Series) -> float:
+    """
+    Retorna score_massa (0–40) baseado em erro relativo em ppm.
+
+    Hierarquia de fontes:
+      1. mass_error_ppm  — fornecido diretamente pelo instrumento (preferido;
+                           já corrigido para o aducto pelo software do equipamento)
+      2. neutral_mass_da vs peso_molecular — calculado como fallback quando
+                           mass_error_ppm não está disponível
+      3. 0.0             — quando nenhuma das fontes acima está disponível
+    """
+    ppm: "float | None" = None
+
+    raw_ppm = row.get("mass_error_ppm")
+    if raw_ppm is not None:
+        try:
+            v = float(raw_ppm)
+            if not pd.isna(v):
+                ppm = abs(v)
+        except (TypeError, ValueError):
+            pass
+
+    if ppm is None:
+        neutral = row.get("neutral_mass_da")
+        teorico = row.get("peso_molecular")
+        if neutral is not None and teorico is not None:
+            try:
+                n, t = float(neutral), float(teorico)
+                if not pd.isna(n) and not pd.isna(t) and t > 0:
+                    ppm = abs(n - t) / t * 1e6
+            except (TypeError, ValueError):
+                pass
+
+    if ppm is None:
+        return 0.0
+
+    if ppm <= TOLERANCIA_PPM_MAX:
+        return 40.0
+    if ppm >= TOLERANCIA_PPM_ZERO:
+        return 0.0
+    faixa = TOLERANCIA_PPM_ZERO - TOLERANCIA_PPM_MAX
+    return 40.0 * (1 - (ppm - TOLERANCIA_PPM_MAX) / faixa)
 
 
 def _calcular_scores(row: pd.Series, mz_sinal: float) -> Tuple[float, float, float]:
     """
     Calcula score_massa, score_metadata e score_total para um candidato.
     Lógica provisória — ponderação final será definida com o IST.
+
+    score_massa usa erro relativo em ppm (escala invariante de massa):
+      - Fonte primária : mass_error_ppm do instrumento (já corrigido para aducto)
+      - Fallback       : ppm calculado de neutral_mass_da vs peso_molecular
+      - 2º fallback    : score_massa = 0 se ambas as fontes forem nulas
     """
-    peso_molecular = row.get("peso_molecular")
-    if peso_molecular is not None:
-        try:
-            delta = abs(float(mz_sinal) - float(peso_molecular))
-            if delta <= TOLERANCIA_MAXIMA:
-                score_massa = 40.0
-            elif delta >= TOLERANCIA_ZERO:
-                score_massa = 0.0
-            else:
-                faixa = TOLERANCIA_ZERO - TOLERANCIA_MAXIMA
-                score_massa = 40.0 * (1 - (delta - TOLERANCIA_MAXIMA) / faixa)
-        except (TypeError, ValueError):
-            score_massa = 0.0
-    else:
-        score_massa = 0.0
+    score_massa = _score_massa_ppm(row)
 
     presentes = sum(
         1 for campo in CAMPOS_METADADO
