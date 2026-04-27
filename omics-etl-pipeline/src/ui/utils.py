@@ -1,20 +1,20 @@
 """
 Utilitários de acesso ao banco para a interface Streamlit.
 
-Toda a leitura de dados passa por aqui.
-A view `vw_ranking_candidatos` é a única fonte de dados da UI — as tabelas
-internas nunca são acessadas diretamente.
+Toda a leitura de dados passa por aqui — as tabelas internas nunca são
+acessadas diretamente pela UI.
+
+Views disponíveis:
+  vw_ranking_candidatos  → batch mais recente com sucesso (uso padrão)
+  vw_ranking_historico   → todos os batches com sucesso (seletor histórico)
 """
 import sqlite3
 from pathlib import Path
 
 import pandas as pd
 
-# omics-etl-pipeline/src/ui/utils.py → sobe 3 níveis → omics-etl-pipeline/
 _BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DB_PATH   = _BASE_DIR / "banco_ist.db"
-
-_VIEW = "vw_ranking_candidatos"
 
 
 def db_existe() -> bool:
@@ -24,21 +24,14 @@ def db_existe() -> bool:
 
 def carregar_ranking() -> pd.DataFrame:
     """
-    Lê todos os registros da view de ranking e retorna um DataFrame.
-
-    Colunas retornadas (definidas pela view):
-        Sinal, m/z Medido, Candidato, Formula, Peso Teorico,
-        Classe Quimica, Score Massa, Score Metadata, Score Total, Rank
-
-    Retorna DataFrame vazio se a view não tiver dados ou se o banco não existir.
+    Retorna todos os candidatos do batch mais recente com sucesso.
+    Usa vw_ranking_candidatos (já filtra pelo batch mais recente).
     """
     if not db_existe():
         return pd.DataFrame()
-
     try:
         conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query(f'SELECT * FROM "{_VIEW}"', conn)
-        return df
+        return pd.read_sql_query('SELECT * FROM "vw_ranking_candidatos"', conn)
     except Exception:
         return pd.DataFrame()
     finally:
@@ -48,22 +41,51 @@ def carregar_ranking() -> pd.DataFrame:
 
 def carregar_sinal(sinal: str) -> pd.DataFrame:
     """
-    Retorna todos os candidatos de um sinal específico, ordenados por Rank.
-
-    Args:
-        sinal: Valor da coluna 'Sinal' (compound_code do equipamento).
+    Retorna todos os candidatos de um sinal específico do batch mais recente,
+    ordenados por Rank.
     """
     if not db_existe():
         return pd.DataFrame()
-
     try:
         conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query(
-            f'SELECT * FROM "{_VIEW}" WHERE "Sinal" = ? ORDER BY "Rank"',
+        return pd.read_sql_query(
+            'SELECT * FROM "vw_ranking_candidatos" WHERE "Sinal" = ? ORDER BY "Rank"',
             conn,
             params=(sinal,),
         )
-        return df
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+
+def listar_batches() -> list:
+    """
+    Retorna todos os batches registrados, do mais recente para o mais antigo.
+    Delega para src.database.batch para evitar duplicação de lógica.
+    """
+    try:
+        from src.database.batch import listar_batches as _listar
+        return _listar()
+    except Exception:
+        return []
+
+
+def carregar_ranking_batch(batch_id: int) -> pd.DataFrame:
+    """
+    Retorna o ranking completo de um batch específico via vw_ranking_historico.
+    Usado pelo seletor de batch histórico na UI (Fase 4).
+    """
+    if not db_existe():
+        return pd.DataFrame()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        return pd.read_sql_query(
+            'SELECT * FROM "vw_ranking_historico" WHERE "Batch ID" = ? ORDER BY "Sinal", "Rank"',
+            conn,
+            params=(batch_id,),
+        )
     except Exception:
         return pd.DataFrame()
     finally:

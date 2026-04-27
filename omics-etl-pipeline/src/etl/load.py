@@ -56,25 +56,44 @@ def _calcular_scores(row: pd.Series, mz_sinal: float) -> Tuple[float, float, flo
 
 
 def _inserir_sinal(
-    cursor: sqlite3.Cursor, compound_code: str, mz: float, retention_time
+    cursor: sqlite3.Cursor,
+    batch_id: int,
+    compound_code: str,
+    mz: float,
+    retention_time,
 ) -> int:
-    """Insere o sinal em fact_sinal e retorna seu id (idempotente via IGNORE)."""
+    """
+    Insere o sinal em fact_sinal scoped pelo batch e retorna seu id.
+    UNIQUE(compound_code, batch_id) garante idempotência por batch.
+    """
     cursor.execute(
         """
-        INSERT OR IGNORE INTO fact_sinal (compound_code, mz, retention_time)
-        VALUES (?, ?, ?)
+        INSERT OR IGNORE INTO fact_sinal (batch_id, compound_code, mz, retention_time)
+        VALUES (?, ?, ?, ?)
         """,
-        (compound_code, mz, retention_time),
+        (batch_id, compound_code, mz, retention_time),
     )
     cursor.execute(
-        "SELECT id FROM fact_sinal WHERE compound_code = ?",
-        (compound_code,),
+        "SELECT id FROM fact_sinal WHERE batch_id = ? AND compound_code = ?",
+        (batch_id, compound_code),
     )
     return cursor.fetchone()[0]
 
 
-def _inserir_molecula(cursor: sqlite3.Cursor, row: pd.Series) -> int:
-    """Insere a molécula em dim_molecula e retorna seu id (idempotente via IGNORE)."""
+def _inserir_molecula(cursor: sqlite3.Cursor, row: pd.Series) -> Tuple[int, bool]:
+    """
+    Insere a molécula em dim_molecula e retorna (id, is_nova).
+
+    dim_molecula é um cache global cross-batch (nome UNIQUE globalmente).
+    is_nova=True indica que a molécula não existia antes — útil para
+    contabilizar chamadas de API efetivas (Fase 3).
+    """
+    nome = str(row["description"])
+    cursor.execute("SELECT id FROM dim_molecula WHERE nome = ?", (nome,))
+    existente = cursor.fetchone()
+    if existente:
+        return existente[0], False   # cache hit — sem chamada de API
+
     cursor.execute(
         """
         INSERT OR IGNORE INTO dim_molecula
@@ -82,7 +101,7 @@ def _inserir_molecula(cursor: sqlite3.Cursor, row: pd.Series) -> int:
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
-            str(row["description"]),
+            nome,
             row.get("formula"),
             row.get("peso_molecular"),
             row.get("pubchem_cid"),
@@ -90,15 +109,13 @@ def _inserir_molecula(cursor: sqlite3.Cursor, row: pd.Series) -> int:
             row.get("classe_quimica"),
         ),
     )
-    cursor.execute(
-        "SELECT id FROM dim_molecula WHERE nome = ?",
-        (str(row["description"]),),
-    )
-    return cursor.fetchone()[0]
+    cursor.execute("SELECT id FROM dim_molecula WHERE nome = ?", (nome,))
+    return cursor.fetchone()[0], True   # nova molécula inserida
 
 
 def _inserir_candidato(
     cursor: sqlite3.Cursor,
+    batch_id: int,
     sinal_id: int,
     molecula_id: int,
     score_massa: float,
@@ -112,21 +129,21 @@ def _inserir_candidato(
     adducts,
 ) -> None:
     """
-    Registra a relação sinal ↔ candidato com dados laboratoriais e scores internos.
+    Registra a relação sinal ↔ candidato com batch_id, dados laboratoriais e scores.
     INSERT OR IGNORE evita duplicata se o par (sinal_id, molecula_id) já existir.
     """
     cursor.execute(
         """
         INSERT OR IGNORE INTO candidato_sinal (
-            sinal_id, molecula_id,
+            batch_id, sinal_id, molecula_id,
             score_lab, score_fragmentacao, mass_error_ppm,
             score_isotopo, neutral_mass_da, adducts,
             score_massa, score_metadata, score_total
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            sinal_id, molecula_id,
+            batch_id, sinal_id, molecula_id,
             score_lab, score_fragmentacao, mass_error_ppm,
             score_isotopo, neutral_mass_da, adducts,
             score_massa, score_metadata, score_total,
@@ -134,36 +151,48 @@ def _inserir_candidato(
     )
 
 
-def _atualizar_ranking(cursor: sqlite3.Cursor) -> None:
+def _atualizar_ranking(cursor: sqlite3.Cursor, batch_id: int) -> None:
     """
-    Calcula rank_posicao para todos os candidatos de cada sinal em lote.
-    Rank 1 = maior score_total. Executado uma vez após todas as inserções.
+    Calcula rank_posicao somente para candidatos do batch atual.
+    Rank 1 = maior score_total dentro do sinal.
+
+    Scoped por batch_id: rankings de batches anteriores ficam intactos.
     """
-    cursor.execute("""
+    cursor.execute(
+        """
         UPDATE candidato_sinal
         SET rank_posicao = (
             SELECT COUNT(*) + 1
             FROM candidato_sinal cs2
-            WHERE cs2.sinal_id = candidato_sinal.sinal_id
+            WHERE cs2.sinal_id    = candidato_sinal.sinal_id
+              AND cs2.batch_id    = candidato_sinal.batch_id
               AND cs2.score_total > candidato_sinal.score_total
         )
-    """)
+        WHERE batch_id = ?
+        """,
+        (batch_id,),
+    )
 
 
-def carregar_dados_no_banco(df: pd.DataFrame) -> bool:
+def carregar_dados_no_banco(df: pd.DataFrame, batch_id: int) -> dict:
     """
-    Distribui o DataFrame enriquecido nas três tabelas do modelo:
-        fact_sinal       → medição bruta do equipamento
-        dim_molecula     → metadados da molécula candidata (APIs)
-        candidato_sinal  → relação N:N com dados laboratoriais e scores
+    Distribui o DataFrame enriquecido nas três tabelas do modelo, scoped
+    pelo batch_id fornecido:
+        fact_sinal       → medição bruta do equipamento (por batch)
+        dim_molecula     → metadados da molécula (cache global cross-batch)
+        candidato_sinal  → relação N:N com dados laboratoriais e scores (por batch)
 
-    Retorna True se todos os registros foram inseridos sem erros.
+    Retorna dict com estatísticas:
+        sinais        — número de sinais únicos inseridos
+        candidatos    — número de candidatos inseridos
+        moleculas_novas — moléculas não existentes antes deste batch
+        erros         — linhas ignoradas por erro
     """
     if df is None or df.empty:
         logger.warning("Nenhum dado para carregar no banco.")
-        return False
+        return {"sinais": 0, "candidatos": 0, "moleculas_novas": 0, "erros": 0}
 
-    logger.info(f"Iniciando carga de {len(df)} registros no banco...")
+    logger.info(f"Carregando {len(df)} registros no banco (batch_id={batch_id})...")
 
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -171,17 +200,25 @@ def carregar_dados_no_banco(df: pd.DataFrame) -> bool:
         cursor = conn.cursor()
 
         erros = 0
+        sinais_inseridos: set = set()
+        candidatos_inseridos = 0
+        moleculas_novas = 0
+
         for idx, row in df.iterrows():
             try:
                 mz = row["mz"]
 
-                sinal_id    = _inserir_sinal(cursor, row["compound_code"], mz, row.get("retention_time"))
-                molecula_id = _inserir_molecula(cursor, row)
+                sinal_id = _inserir_sinal(cursor, batch_id, row["compound_code"], mz, row.get("retention_time"))
+                sinais_inseridos.add(sinal_id)
+
+                molecula_id, is_nova = _inserir_molecula(cursor, row)
+                if is_nova:
+                    moleculas_novas += 1
 
                 score_massa, score_metadata, score_total = _calcular_scores(row, mz)
 
                 _inserir_candidato(
-                    cursor, sinal_id, molecula_id,
+                    cursor, batch_id, sinal_id, molecula_id,
                     score_massa, score_metadata, score_total,
                     score_lab          = _to_float(row.get("score_lab")),
                     score_fragmentacao = _to_float(row.get("score_fragmentacao")),
@@ -190,27 +227,36 @@ def carregar_dados_no_banco(df: pd.DataFrame) -> bool:
                     neutral_mass_da    = _to_float(row.get("neutral_mass_da")),
                     adducts            = row.get("adducts"),
                 )
+                candidatos_inseridos += 1
 
             except Exception as e:
                 logger.warning(f"Linha {idx} ignorada por erro: {e}")
                 erros += 1
 
-        _atualizar_ranking(cursor)
+        _atualizar_ranking(cursor, batch_id)
         conn.commit()
 
-        carregados = len(df) - erros
-        logger.info(f"Carga concluida: {carregados} inseridos, {erros} ignorados.")
-        return erros == 0
+        logger.info(
+            f"Carga concluída: {len(sinais_inseridos)} sinais, "
+            f"{candidatos_inseridos} candidatos, "
+            f"{moleculas_novas} moléculas novas, {erros} erros."
+        )
+        return {
+            "sinais":          len(sinais_inseridos),
+            "candidatos":      candidatos_inseridos,
+            "moleculas_novas": moleculas_novas,
+            "erros":           erros,
+        }
 
     except Exception as e:
-        logger.error(f"Erro critico na carga: {e}")
-        return False
+        logger.error(f"Erro crítico na carga: {e}")
+        return {"sinais": 0, "candidatos": 0, "moleculas_novas": 0, "erros": -1}
     finally:
         if "conn" in locals():
             conn.close()
 
 
-def _to_float(valor) -> float | None:
+def _to_float(valor) -> "float | None":
     """Converte para float ou retorna None se o valor for nulo/inválido."""
     if valor is None:
         return None
