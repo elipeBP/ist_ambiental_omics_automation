@@ -1,11 +1,16 @@
 """
-Migração não-destrutiva do schema v1 → v2.
+Migrações não-destrutivas do schema do banco de dados.
 
-v1: fact_sinal tem compound_code UNIQUE global; candidato_sinal sem batch_id.
-v2: fact_sinal tem UNIQUE(compound_code, batch_id); candidato_sinal tem batch_id.
+v1 → v2: fact_sinal ganha batch_id; candidato_sinal ganha batch_id.
+          Dados existentes preservados sob batch sintético 'legado'.
 
-Todos os dados existentes são preservados sob um batch sintético 'legado'.
-A migração é idempotente: re-executar é seguro.
+v2 → v3: candidato_sinal ganha score_ranking e score_data_quality.
+          score_ranking substitui score_total como critério de ordenação.
+          score_data_quality indica completude de metadados (não entra no rank).
+          Dados históricos recalculados inline; score_total/score_metadata
+          mantidos como aliases de backward compatibility.
+
+Todas as migrações são idempotentes: re-executar é seguro.
 """
 import logging
 import sqlite3
@@ -127,4 +132,176 @@ def migrar_v1_para_v2(conn: sqlite3.Connection) -> None:
     logger.info(
         f"Migração v1→v2 concluída: batch_id={legado_id} (legado), "
         f"{total_sinais} sinais, {total_candidatos} candidatos preservados."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Migração v2 → v3
+# ---------------------------------------------------------------------------
+
+def _precisa_migrar_v3(conn: sqlite3.Connection) -> bool:
+    """Retorna True se candidato_sinal existe mas ainda não tem score_ranking."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='candidato_sinal'"
+    )
+    if not cur.fetchone():
+        return False
+    cur.execute("PRAGMA table_info(candidato_sinal)")
+    return "score_ranking" not in {row[1] for row in cur.fetchall()}
+
+
+def migrar_v2_para_v3(conn: sqlite3.Connection) -> None:
+    """
+    Migração v2 → v3: adiciona score_ranking e score_data_quality em
+    candidato_sinal e recalcula os scores de todos os registros históricos.
+
+    Passos:
+        1. Adiciona colunas score_ranking e score_data_quality via ALTER TABLE.
+        2. Lê todos os candidatos com seus dados de instrumento e de dim_molecula.
+        3. Recalcula score_ranking (média ponderada) e score_data_quality
+           (completude) para cada registro usando a mesma lógica de load.py.
+        4. Atualiza score_total e score_metadata como aliases de backward compat.
+        5. Recalcula rank_posicao usando score_ranking para todos os batches.
+
+    A lógica de scoring está inlineada aqui para manter a migração
+    auto-contida e independente de versões futuras de load.py.
+    """
+    if not _precisa_migrar_v3(conn):
+        return
+
+    logger.info("Iniciando migração v2 → v3 (adicionando score_ranking / score_data_quality)...")
+    cur = conn.cursor()
+
+    # 1. Adiciona colunas
+    for coluna in ("score_ranking", "score_data_quality"):
+        try:
+            cur.execute(
+                f"ALTER TABLE candidato_sinal ADD COLUMN {coluna} REAL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # já existe — re-execução segura
+
+    # 2. Lê candidatos com dados necessários para o cálculo
+    cur.execute("""
+        SELECT
+            c.id,
+            c.score_fragmentacao,
+            c.score_lab,
+            c.score_isotopo,
+            c.mass_error_ppm,
+            c.neutral_mass_da,
+            m.peso_molecular,
+            m.formula,
+            m.pubchem_cid,
+            m.chebi_id,
+            m.classe_quimica
+        FROM candidato_sinal c
+        JOIN dim_molecula m ON c.molecula_id = m.id
+    """)
+    registros = cur.fetchall()
+
+    # 3 + 4. Recalcula e prepara updates
+    # Lógica inlineada para independência de versões futuras de load.py
+    _W = {"frag": 0.40, "lab": 0.30, "iso": 0.20, "massa": 0.10}
+    _PPM_MAX  = 5.0
+    _PPM_ZERO = 20.0
+    _CAMPOS_DQ = ("formula", "pubchem_cid", "peso_molecular", "chebi_id", "classe_quimica")
+
+    def _n01(v, mx):
+        if v is None:
+            return None
+        try:
+            f = float(v)
+            return None if f != f else max(0.0, min(1.0, f / mx))  # nan check
+        except (TypeError, ValueError):
+            return None
+
+    def _n_massa(mep, nm, pm):
+        ppm = None
+        if mep is not None:
+            try:
+                ppm = abs(float(mep))
+            except (TypeError, ValueError):
+                pass
+        if ppm is None and nm is not None and pm is not None:
+            try:
+                n, t = float(nm), float(pm)
+                if t > 0:
+                    ppm = abs(n - t) / t * 1e6
+            except (TypeError, ValueError):
+                pass
+        if ppm is None:
+            return None
+        if ppm <= _PPM_MAX:
+            return 1.0
+        if ppm >= _PPM_ZERO:
+            return 0.0
+        return 1.0 - (ppm - _PPM_MAX) / (_PPM_ZERO - _PPM_MAX)
+
+    updates = []
+    for (cid, sf, sl, si, mep, nm, pm, formula, pcid, chebi, classe) in registros:
+        row = {
+            "score_fragmentacao": sf, "score_lab": sl, "score_isotopo": si,
+            "mass_error_ppm": mep, "neutral_mass_da": nm, "peso_molecular": pm,
+            "formula": formula, "pubchem_cid": pcid, "chebi_id": chebi,
+            "classe_quimica": classe,
+        }
+
+        componentes = [
+            (_W["frag"],  _n01(sf,   100.0)),
+            (_W["lab"],   _n01(sl,   100.0)),
+            (_W["iso"],   _n01(si,   100.0)),
+            (_W["massa"], _n_massa(mep, nm, pm)),
+        ]
+        validos = [(w, v) for w, v in componentes if v is not None]
+        if validos:
+            soma_w = sum(w for w, _ in validos)
+            ranking = round(sum(w * v for w, v in validos) / soma_w * 100, 4)
+        else:
+            ranking = 0.0
+
+        ok = sum(
+            1 for campo in _CAMPOS_DQ
+            if row.get(campo) is not None
+            and str(row.get(campo)).strip() not in ("", "None", "Nao classificada")
+        )
+        quality = round(ok / len(_CAMPOS_DQ) * 100, 1)
+
+        updates.append((ranking, quality, ranking, quality, cid))
+
+    cur.executemany(
+        """
+        UPDATE candidato_sinal SET
+            score_ranking      = ?,
+            score_data_quality = ?,
+            score_total        = ?,
+            score_metadata     = ?
+        WHERE id = ?
+        """,
+        updates,
+    )
+
+    # 5. Recalcula rank_posicao usando score_ranking para todos os batches
+    cur.execute("SELECT DISTINCT batch_id FROM candidato_sinal")
+    for (bid,) in cur.fetchall():
+        cur.execute(
+            """
+            UPDATE candidato_sinal
+            SET rank_posicao = (
+                SELECT COUNT(*) + 1
+                FROM candidato_sinal cs2
+                WHERE cs2.sinal_id      = candidato_sinal.sinal_id
+                  AND cs2.batch_id      = candidato_sinal.batch_id
+                  AND cs2.score_ranking > candidato_sinal.score_ranking
+            )
+            WHERE batch_id = ?
+            """,
+            (bid,),
+        )
+
+    conn.commit()
+    logger.info(
+        f"Migração v2→v3 concluída: {len(updates)} candidatos com "
+        "score_ranking recalculado."
     )

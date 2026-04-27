@@ -14,19 +14,63 @@ from src.database.connection import DB_PATH
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Parâmetros do scoring interno
-# (fórmula de score_total a validar com IST antes de tornar definitiva)
+# score_massa_ppm — componente de erro de massa
 #
-# Thresholds de ppm baseados em boas práticas de HRMS (Q-TOF / Orbitrap).
+# Thresholds baseados em boas práticas de HRMS (Q-TOF / Orbitrap).
 # Instrumentos modernos de alta resolução operam tipicamente a 1–5 ppm.
-# Estes valores são defaults defensáveis — podem ser calibrados pelo IST
-# conforme o equipamento utilizado (ex.: 2 ppm para Orbitrap, 10 ppm para Q-TOF).
+# Calibráveis pelo IST conforme o equipamento utilizado.
 # ---------------------------------------------------------------------------
 TOLERANCIA_PPM_MAX  = 5.0   # ≤  5 ppm → score_massa = 40 (match excelente)
 TOLERANCIA_PPM_ZERO = 20.0  # ≥ 20 ppm → score_massa = 0  (match descartado)
 
-PONTOS_POR_METADADO = 6
-CAMPOS_METADADO = ["formula", "pubchem_cid", "chebi_id", "classe_quimica", "peso_molecular"]
+# ---------------------------------------------------------------------------
+# score_ranking — pesos da média ponderada linear
+#
+# VALORES PROVISÓRIOS — devem ser calibrados pelo IST com base em resultados
+# reais do instrumento e critérios de confiança da análise laboratorial.
+#
+# Fundamentação técnica:
+#   W_FRAG  = 0.40 → fragmentação MS/MS: critério gold-standard em LC-MS/MS;
+#                    único que distingue isômeros com mesma fórmula molecular.
+#   W_LAB   = 0.30 → score geral do instrumento: integra heurísticas internas
+#                    do software do equipamento (adducts, RT, etc.).
+#   W_ISO   = 0.20 → similaridade isotópica: valida composição elementar;
+#                    menos discriminativo que fragmentação para isômeros.
+#   W_MASSA = 0.10 → erro de massa em ppm: tiebreaker — dados de HRMS já
+#                    passam por filtro interno do instrumento, variação pequena.
+#
+# Referências: Schymanski et al. (2014) Environ. Sci. Technol. 48(4):2097–2098;
+#              Sumner et al. (2007) Metabolomics 3(3):211–221.
+# ---------------------------------------------------------------------------
+W_FRAG  = 0.40
+W_LAB   = 0.30
+W_ISO   = 0.20
+W_MASSA = 0.10
+
+# Campos avaliados no score_data_quality (completude de metadados externos)
+_CAMPOS_DATA_QUALITY = (
+    "formula", "pubchem_cid", "peso_molecular", "chebi_id", "classe_quimica"
+)
+
+
+# ---------------------------------------------------------------------------
+# Funções de scoring
+# ---------------------------------------------------------------------------
+
+def _to_01(value, max_val: float) -> "float | None":
+    """
+    Normaliza value para [0,1] dividindo por max_val.
+    Retorna None se value for nulo, NaN ou inválido.
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+        if pd.isna(f):
+            return None
+        return max(0.0, min(1.0, f / max_val))
+    except (TypeError, ValueError):
+        return None
 
 
 def _score_massa_ppm(row: pd.Series) -> float:
@@ -73,27 +117,66 @@ def _score_massa_ppm(row: pd.Series) -> float:
     return 40.0 * (1 - (ppm - TOLERANCIA_PPM_MAX) / faixa)
 
 
-def _calcular_scores(row: pd.Series, mz_sinal: float) -> Tuple[float, float, float]:
+def _normalizar_score_massa(row) -> "float | None":
     """
-    Calcula score_massa, score_metadata e score_total para um candidato.
-    Lógica provisória — ponderação final será definida com o IST.
-
-    score_massa usa erro relativo em ppm (escala invariante de massa):
-      - Fonte primária : mass_error_ppm do instrumento (já corrigido para aducto)
-      - Fallback       : ppm calculado de neutral_mass_da vs peso_molecular
-      - 2º fallback    : score_massa = 0 se ambas as fontes forem nulas
+    Retorna score_massa normalizado para [0,1], ou None se não há
+    fonte de dado ppm disponível (exclui do cálculo de ranking).
     """
-    score_massa = _score_massa_ppm(row)
+    has_data = (
+        row.get("mass_error_ppm") is not None
+        or (
+            row.get("neutral_mass_da") is not None
+            and row.get("peso_molecular") is not None
+        )
+    )
+    if not has_data:
+        return None
+    return _score_massa_ppm(row) / 40.0
 
-    presentes = sum(
-        1 for campo in CAMPOS_METADADO
+
+def _calcular_score_ranking(row) -> float:
+    """
+    Média ponderada linear dos scores de identificação molecular, normalizada
+    para escala 0–100.
+
+    Cada componente é normalizado para [0,1] antes de entrar na fórmula.
+    Componentes nulos são excluídos e os pesos restantes são renormalizados
+    automaticamente, preservando a proporção relativa entre eles.
+
+    Pesos configurados em W_FRAG / W_LAB / W_ISO / W_MASSA (ver constantes).
+    """
+    componentes: list = [
+        (W_FRAG,  _to_01(row.get("score_fragmentacao"), 100.0)),
+        (W_LAB,   _to_01(row.get("score_lab"),          100.0)),
+        (W_ISO,   _to_01(row.get("score_isotopo"),      100.0)),
+        (W_MASSA, _normalizar_score_massa(row)),
+    ]
+    validos = [(w, v) for w, v in componentes if v is not None]
+    if not validos:
+        return 0.0
+    soma_pesos = sum(w for w, _ in validos)
+    return round(sum(w * v for w, v in validos) / soma_pesos * 100, 4)
+
+
+def _calcular_score_data_quality(row) -> float:
+    """
+    Percentual de metadados externos preenchidos (0–100%).
+
+    Avalia os 5 campos de enriquecimento via API (PubChem + ChEBI).
+    NÃO entra no cálculo de rank_posicao — serve exclusivamente como
+    indicador de completude de dados para a interface e relatórios.
+    """
+    ok = sum(
+        1 for campo in _CAMPOS_DATA_QUALITY
         if row.get(campo) is not None
         and str(row.get(campo)).strip() not in ("", "None", "Nao classificada")
     )
-    score_metadata = presentes * PONTOS_POR_METADADO
-    score_total = round(score_massa + score_metadata, 4)
-    return round(score_massa, 4), round(score_metadata, 4), score_total
+    return round(ok / len(_CAMPOS_DATA_QUALITY) * 100, 1)
 
+
+# ---------------------------------------------------------------------------
+# Funções de persistência (inserção nas tabelas do modelo)
+# ---------------------------------------------------------------------------
 
 def _inserir_sinal(
     cursor: sqlite3.Cursor,
@@ -126,7 +209,7 @@ def _inserir_molecula(cursor: sqlite3.Cursor, row: pd.Series) -> Tuple[int, bool
 
     dim_molecula é um cache global cross-batch (nome UNIQUE globalmente).
     is_nova=True indica que a molécula não existia antes — útil para
-    contabilizar chamadas de API efetivas (Fase 3).
+    contabilizar chamadas de API efetivas.
     """
     nome = str(row["description"])
     cursor.execute("SELECT id FROM dim_molecula WHERE nome = ?", (nome,))
@@ -159,8 +242,8 @@ def _inserir_candidato(
     sinal_id: int,
     molecula_id: int,
     score_massa: float,
-    score_metadata: float,
-    score_total: float,
+    score_ranking: float,
+    score_data_quality: float,
     score_lab,
     score_fragmentacao,
     mass_error_ppm,
@@ -169,7 +252,10 @@ def _inserir_candidato(
     adducts,
 ) -> None:
     """
-    Registra a relação sinal ↔ candidato com batch_id, dados laboratoriais e scores.
+    Registra a relação sinal ↔ candidato com batch_id, scores e dados laboratoriais.
+
+    score_total e score_metadata são mantidos como aliases de backward compatibility
+    para views e código existente que ainda referencie os nomes antigos.
     INSERT OR IGNORE evita duplicata se o par (sinal_id, molecula_id) já existir.
     """
     cursor.execute(
@@ -178,23 +264,27 @@ def _inserir_candidato(
             batch_id, sinal_id, molecula_id,
             score_lab, score_fragmentacao, mass_error_ppm,
             score_isotopo, neutral_mass_da, adducts,
-            score_massa, score_metadata, score_total
+            score_massa,
+            score_ranking,      score_data_quality,
+            score_total,        score_metadata
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             batch_id, sinal_id, molecula_id,
             score_lab, score_fragmentacao, mass_error_ppm,
             score_isotopo, neutral_mass_da, adducts,
-            score_massa, score_metadata, score_total,
+            score_massa,
+            score_ranking,      score_data_quality,
+            score_ranking,      score_data_quality,   # aliases backward compat
         ),
     )
 
 
 def _atualizar_ranking(cursor: sqlite3.Cursor, batch_id: int) -> None:
     """
-    Calcula rank_posicao somente para candidatos do batch atual.
-    Rank 1 = maior score_total dentro do sinal.
+    Calcula rank_posicao usando score_ranking para os candidatos do batch atual.
+    Rank 1 = maior score_ranking dentro do sinal.
 
     Scoped por batch_id: rankings de batches anteriores ficam intactos.
     """
@@ -204,9 +294,9 @@ def _atualizar_ranking(cursor: sqlite3.Cursor, batch_id: int) -> None:
         SET rank_posicao = (
             SELECT COUNT(*) + 1
             FROM candidato_sinal cs2
-            WHERE cs2.sinal_id    = candidato_sinal.sinal_id
-              AND cs2.batch_id    = candidato_sinal.batch_id
-              AND cs2.score_total > candidato_sinal.score_total
+            WHERE cs2.sinal_id     = candidato_sinal.sinal_id
+              AND cs2.batch_id     = candidato_sinal.batch_id
+              AND cs2.score_ranking > candidato_sinal.score_ranking
         )
         WHERE batch_id = ?
         """,
@@ -220,13 +310,13 @@ def carregar_dados_no_banco(df: pd.DataFrame, batch_id: int) -> dict:
     pelo batch_id fornecido:
         fact_sinal       → medição bruta do equipamento (por batch)
         dim_molecula     → metadados da molécula (cache global cross-batch)
-        candidato_sinal  → relação N:N com dados laboratoriais e scores (por batch)
+        candidato_sinal  → relação N:N com scores de identificação (por batch)
 
     Retorna dict com estatísticas:
-        sinais        — número de sinais únicos inseridos
-        candidatos    — número de candidatos inseridos
+        sinais          — número de sinais únicos inseridos
+        candidatos      — número de candidatos inseridos
         moleculas_novas — moléculas não existentes antes deste batch
-        erros         — linhas ignoradas por erro
+        erros           — linhas ignoradas por erro
     """
     if df is None or df.empty:
         logger.warning("Nenhum dado para carregar no banco.")
@@ -248,18 +338,24 @@ def carregar_dados_no_banco(df: pd.DataFrame, batch_id: int) -> dict:
             try:
                 mz = row["mz"]
 
-                sinal_id = _inserir_sinal(cursor, batch_id, row["compound_code"], mz, row.get("retention_time"))
+                sinal_id = _inserir_sinal(
+                    cursor, batch_id, row["compound_code"], mz, row.get("retention_time")
+                )
                 sinais_inseridos.add(sinal_id)
 
                 molecula_id, is_nova = _inserir_molecula(cursor, row)
                 if is_nova:
                     moleculas_novas += 1
 
-                score_massa, score_metadata, score_total = _calcular_scores(row, mz)
+                score_massa       = _score_massa_ppm(row)
+                score_ranking     = _calcular_score_ranking(row)
+                score_data_quality = _calcular_score_data_quality(row)
 
                 _inserir_candidato(
                     cursor, batch_id, sinal_id, molecula_id,
-                    score_massa, score_metadata, score_total,
+                    score_massa        = score_massa,
+                    score_ranking      = score_ranking,
+                    score_data_quality = score_data_quality,
                     score_lab          = _to_float(row.get("score_lab")),
                     score_fragmentacao = _to_float(row.get("score_fragmentacao")),
                     mass_error_ppm     = _to_float(row.get("mass_error_ppm")),

@@ -82,6 +82,17 @@ CREATE TABLE IF NOT EXISTS dim_molecula (
 #   extra através de fact_sinal. O UNIQUE(sinal_id, molecula_id) é
 #   implicitamente scoped por batch pois sinal_id já aponta para um sinal
 #   de um batch específico.
+#
+#   score_ranking:      média ponderada linear dos scores do instrumento +
+#                       score_massa ppm. Determina rank_posicao.
+#                       Pesos: fragmentação 40% | lab 30% | isotopo 20% | massa 10%.
+#                       PROVISÓRIO — calibrar com IST (ver load.py: W_FRAG etc.)
+#
+#   score_data_quality: % dos campos de metadados externos preenchidos (0–100).
+#                       NÃO entra no ranking — indicador de completude de dados.
+#
+#   score_total:        alias de backward compatibility para score_ranking.
+#   score_metadata:     alias de backward compatibility para score_data_quality.
 # ---------------------------------------------------------------------------
 SQL_CANDIDATO_SINAL = """
 CREATE TABLE IF NOT EXISTS candidato_sinal (
@@ -96,10 +107,15 @@ CREATE TABLE IF NOT EXISTS candidato_sinal (
     score_isotopo      REAL,
     neutral_mass_da    REAL,
     adducts            TEXT,
-    -- Scores internos do pipeline (fórmula provisória — validação IST pendente)
+    -- Componente de erro de massa (0–40, calculado pelo pipeline)
     score_massa        REAL DEFAULT 0,
-    score_metadata     REAL DEFAULT 0,
+    -- Score de ranking: média ponderada linear (0–100) — determina rank_posicao
+    score_ranking      REAL DEFAULT 0,
+    -- Score de qualidade de dados: completude dos metadados externos (0–100%)
+    score_data_quality REAL DEFAULT 0,
+    -- Aliases de backward compatibility (= score_ranking e score_data_quality)
     score_total        REAL DEFAULT 0,
+    score_metadata     REAL DEFAULT 0,
     rank_posicao       INTEGER,
     data_calculo       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(sinal_id, molecula_id)
@@ -138,24 +154,25 @@ CREATE INDEX IF NOT EXISTS idx_candidato_batch
 SQL_VIEW_RANKING = """
 CREATE VIEW vw_ranking_candidatos AS
 SELECT
-    b.id                 AS "Batch ID",
-    b.iniciado_em        AS "Data Execucao",
-    s.compound_code      AS "Sinal",
-    s.mz                 AS "m/z Medido",
-    m.nome               AS "Candidato",
-    m.formula            AS "Formula",
-    m.peso_molecular     AS "Peso Teorico",
-    m.classe_quimica     AS "Classe Quimica",
-    c.adducts            AS "Adducts",
-    c.neutral_mass_da    AS "Neutral Mass (Da)",
-    c.score_lab          AS "Score Lab",
-    c.score_fragmentacao AS "Score Fragmentacao",
-    c.mass_error_ppm     AS "Mass Error (ppm)",
-    c.score_isotopo      AS "Isotope Similarity",
-    c.score_massa        AS "Score Massa",
-    c.score_metadata     AS "Score Metadata",
-    c.score_total        AS "Score Total",
-    c.rank_posicao       AS "Rank"
+    b.id                   AS "Batch ID",
+    b.iniciado_em          AS "Data Execucao",
+    s.compound_code        AS "Sinal",
+    s.mz                   AS "m/z Medido",
+    m.nome                 AS "Candidato",
+    m.formula              AS "Formula",
+    m.peso_molecular       AS "Peso Teorico",
+    m.classe_quimica       AS "Classe Quimica",
+    c.adducts              AS "Adducts",
+    c.neutral_mass_da      AS "Neutral Mass (Da)",
+    c.score_lab            AS "Score Lab",
+    c.score_fragmentacao   AS "Score Fragmentacao",
+    c.mass_error_ppm       AS "Mass Error (ppm)",
+    c.score_isotopo        AS "Isotope Similarity",
+    c.score_massa          AS "Score Massa",
+    c.score_ranking        AS "Score Ranking",
+    c.score_data_quality   AS "Score Qualidade Dados",
+    c.score_ranking        AS "Score Total",
+    c.rank_posicao         AS "Rank"
 FROM candidato_sinal c
 JOIN fact_sinal      s ON c.sinal_id    = s.id
 JOIN dim_molecula    m ON c.molecula_id = m.id
@@ -171,26 +188,27 @@ ORDER BY s.compound_code, c.rank_posicao;
 SQL_VIEW_HISTORICO = """
 CREATE VIEW vw_ranking_historico AS
 SELECT
-    b.id                 AS "Batch ID",
-    b.iniciado_em        AS "Data Execucao",
-    b.nome_ident         AS "Arquivo Ident",
-    b.nome_abund         AS "Arquivo Abund",
-    s.compound_code      AS "Sinal",
-    s.mz                 AS "m/z Medido",
-    m.nome               AS "Candidato",
-    m.formula            AS "Formula",
-    m.peso_molecular     AS "Peso Teorico",
-    m.classe_quimica     AS "Classe Quimica",
-    c.adducts            AS "Adducts",
-    c.neutral_mass_da    AS "Neutral Mass (Da)",
-    c.score_lab          AS "Score Lab",
-    c.score_fragmentacao AS "Score Fragmentacao",
-    c.mass_error_ppm     AS "Mass Error (ppm)",
-    c.score_isotopo      AS "Isotope Similarity",
-    c.score_massa        AS "Score Massa",
-    c.score_metadata     AS "Score Metadata",
-    c.score_total        AS "Score Total",
-    c.rank_posicao       AS "Rank"
+    b.id                   AS "Batch ID",
+    b.iniciado_em          AS "Data Execucao",
+    b.nome_ident           AS "Arquivo Ident",
+    b.nome_abund           AS "Arquivo Abund",
+    s.compound_code        AS "Sinal",
+    s.mz                   AS "m/z Medido",
+    m.nome                 AS "Candidato",
+    m.formula              AS "Formula",
+    m.peso_molecular       AS "Peso Teorico",
+    m.classe_quimica       AS "Classe Quimica",
+    c.adducts              AS "Adducts",
+    c.neutral_mass_da      AS "Neutral Mass (Da)",
+    c.score_lab            AS "Score Lab",
+    c.score_fragmentacao   AS "Score Fragmentacao",
+    c.mass_error_ppm       AS "Mass Error (ppm)",
+    c.score_isotopo        AS "Isotope Similarity",
+    c.score_massa          AS "Score Massa",
+    c.score_ranking        AS "Score Ranking",
+    c.score_data_quality   AS "Score Qualidade Dados",
+    c.score_ranking        AS "Score Total",
+    c.rank_posicao         AS "Rank"
 FROM candidato_sinal c
 JOIN fact_sinal      s ON c.sinal_id    = s.id
 JOIN dim_molecula    m ON c.molecula_id = m.id
@@ -211,21 +229,22 @@ def criar_tabelas() -> None:
 
     Seguro para re-execução em qualquer estado do banco.
     """
-    from src.database.migrate import migrar_v1_para_v2
+    from src.database.migrate import migrar_v1_para_v2, migrar_v2_para_v3
 
     logger.info("Inicializando schema do banco de dados...")
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON;")
 
     try:
-        # Migração antes de criar tabelas (batch_execucao já existe da Fase 1
-        # em bancos atualizados, mas precisa existir antes da migração rodar)
+        # Migrações executadas antes das CREATE IF NOT EXISTS para garantir
+        # que o schema atual cobre todas as colunas esperadas pelo DDL.
         cur = conn.cursor()
         cur.execute(SQL_BATCH_EXECUCAO)
         cur.execute(SQL_INDICE_BATCH_STATUS)
         conn.commit()
 
-        migrar_v1_para_v2(conn)
+        migrar_v1_para_v2(conn)   # batch_id em fact_sinal / candidato_sinal
+        migrar_v2_para_v3(conn)   # score_ranking / score_data_quality
 
         # Tabelas restantes (idempotentes)
         cur.execute(SQL_FACT_SINAL)
