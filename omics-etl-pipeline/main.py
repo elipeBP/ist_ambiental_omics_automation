@@ -11,6 +11,7 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 from src.etl.job import PipelineJob
+from src.etl.validate import BatchDuplicadoError
 from src.pipeline import executar_pipeline_com_job
 
 logging.basicConfig(
@@ -36,7 +37,11 @@ if __name__ == "__main__":
         nome_abund=nome_abund,
     )
 
-    batch_id = executar_pipeline_com_job(job)
+    try:
+        batch_id = executar_pipeline_com_job(job)
+    except BatchDuplicadoError as e:
+        logger.info(f"Batch ignorado (duplicado): {e}")
+        batch_id = None
 
     if batch_id is not None:
         logger.info(f"Pipeline finalizado com sucesso. batch_id={batch_id}")

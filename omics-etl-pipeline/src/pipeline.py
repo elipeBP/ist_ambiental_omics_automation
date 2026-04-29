@@ -66,9 +66,8 @@ def executar_pipeline_com_job(job: PipelineJob) -> "int | None":
             nome_abund=job.nome_abund,
             fonte=job.fonte,
         )
-    except BatchDuplicadoError as e:
-        logger.info(f"Batch ignorado (duplicado): {e}")
-        return None
+    except BatchDuplicadoError:
+        raise  # chamador decide: CLI loga e ignora, UI exibe mensagem informativa
 
     atualizar_status_batch(batch_id, "executando")
 

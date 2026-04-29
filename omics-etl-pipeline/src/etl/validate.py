@@ -25,6 +25,9 @@ class BatchValidacaoError(Exception):
 
 class BatchDuplicadoError(Exception):
     """Par de arquivos já processado com sucesso — nenhuma ação necessária."""
+    def __init__(self, msg: str, batch_id: "int | None" = None):
+        super().__init__(msg)
+        self.batch_id = batch_id
 
 
 class ArquivosValidados(NamedTuple):

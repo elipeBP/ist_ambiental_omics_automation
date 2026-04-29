@@ -14,7 +14,12 @@ import pandas as pd
 _ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from src.ui.utils import carregar_ranking, carregar_sinal, db_existe
+from src.ui.utils import (
+    carregar_ranking,
+    carregar_ranking_batch,
+    listar_batches,
+    db_existe,
+)
 
 # ---------------------------------------------------------------------------
 # Configuração da página
@@ -47,14 +52,74 @@ if not db_existe():
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Carregamento dos dados
+# Carrega lista de batches para o seletor (TTL curto — lista muda após uploads)
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=30)
+def _listar_batches_ui() -> list:
+    return listar_batches()
+
+
+batches_todos   = _listar_batches_ui()
+batches_sucesso = [b for b in batches_todos if b["status"] == "sucesso"]
+
+# ---------------------------------------------------------------------------
+# Sidebar — seletor de experimento (batch)
+# ---------------------------------------------------------------------------
+st.sidebar.header("Experimento")
+
+# Recebe navegação de outras páginas (Histórico / Carregar Dados)
+_ir_para = st.session_state.pop("ir_para_batch", None)
+
+_MAIS_RECENTE = None
+opcoes_ids    = [_MAIS_RECENTE] + [b["id"] for b in batches_sucesso]
+
+
+def _label_batch(bid: "int | None") -> str:
+    if bid is None:
+        sufixo = f" (#{batches_sucesso[0]['id']})" if batches_sucesso else ""
+        return f"Mais recente{sufixo}"
+    b = next((x for x in batches_sucesso if x["id"] == bid), None)
+    if not b:
+        return f"Batch #{bid}"
+    data = (b["iniciado_em"] or "")[:10]
+    nome = b["nome_ident"]
+    if len(nome) > 22:
+        nome = nome[:19] + "..."
+    return f"#{bid} — {data} | {nome}"
+
+
+idx_default = 0
+if _ir_para is not None and _ir_para in opcoes_ids:
+    idx_default = opcoes_ids.index(_ir_para)
+
+batch_sel_id = st.sidebar.selectbox(
+    "Selecione o experimento:",
+    options=opcoes_ids,
+    index=idx_default,
+    format_func=_label_batch,
+)
+
+st.sidebar.divider()
+
+# ---------------------------------------------------------------------------
+# Carregamento dos dados conforme seleção
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=60)
 def _dados_completos() -> pd.DataFrame:
     return carregar_ranking()
 
 
-df_completo = _dados_completos()
+@st.cache_data(ttl=300)
+def _dados_batch(batch_id: int) -> pd.DataFrame:
+    return carregar_ranking_batch(batch_id)
+
+
+if batch_sel_id is None:
+    df_completo = _dados_completos()
+    batch_info  = None
+else:
+    df_completo = _dados_batch(batch_sel_id)
+    batch_info  = next((b for b in batches_sucesso if b["id"] == batch_sel_id), None)
 
 if df_completo.empty:
     st.info(
@@ -64,7 +129,7 @@ if df_completo.empty:
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Sidebar — filtro por sinal
+# Sidebar — filtro por sinal (depende dos dados carregados)
 # ---------------------------------------------------------------------------
 sinais = sorted(df_completo["Sinal"].dropna().unique().tolist())
 
@@ -75,7 +140,6 @@ sinal_escolhido = st.sidebar.selectbox(
     [opcao_todos] + sinais,
 )
 
-# Informação sobre o modelo de scoring na sidebar
 with st.sidebar.expander("ℹ️ Sobre o Score Ranking", expanded=False):
     st.markdown(
         """
@@ -97,10 +161,42 @@ with st.sidebar.expander("ℹ️ Sobre o Score Ranking", expanded=False):
     )
 
 # ---------------------------------------------------------------------------
+# Detecção da coluna de score (backward compat)
+# ---------------------------------------------------------------------------
+score_col = "Score Ranking" if "Score Ranking" in df_completo.columns else "Score Total"
+
+# ---------------------------------------------------------------------------
+# Card de resumo do batch (somente quando experimento histórico está selecionado)
+# ---------------------------------------------------------------------------
+if batch_info:
+    with st.container(border=True):
+        st.markdown(f"#### Batch #{batch_info['id']} — análise histórica")
+        c1, c2, c3 = st.columns(3)
+
+        data_raw = batch_info.get("iniciado_em") or ""
+        data_fmt = data_raw[:16].replace("T", " ") if data_raw else "—"
+        c1.markdown(f"**Processado em**  \n{data_fmt}")
+
+        c2.markdown(
+            f"**Arquivos**  \n"
+            f"{batch_info['nome_ident']}  \n"
+            f"{batch_info['nome_abund']}"
+        )
+
+        sinais_n = batch_info.get("total_sinais")
+        cand_n   = batch_info.get("total_candidatos")
+        apis_n   = batch_info.get("total_moleculas_api")
+        c3.markdown(
+            f"**{sinais_n if sinais_n is not None else '—'}** sinais · "
+            f"**{cand_n if cand_n is not None else '—'}** candidatos · "
+            f"**{apis_n if apis_n is not None else '—'}** novas moléculas"
+        )
+    st.divider()
+
+# ---------------------------------------------------------------------------
 # Métricas resumidas (topo da página)
 # ---------------------------------------------------------------------------
 rank1 = df_completo[df_completo["Rank"] == 1]
-score_col = "Score Ranking" if "Score Ranking" in df_completo.columns else "Score Total"
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Total de sinais",     df_completo["Sinal"].nunique())
@@ -156,17 +252,17 @@ st.dataframe(
 
 # ---------------------------------------------------------------------------
 # Detalhamento — aparece somente quando um sinal é selecionado
+# Filtra de df_completo (já carregado) — funciona para batch atual e histórico
 # ---------------------------------------------------------------------------
 if sinal_escolhido != opcao_todos:
     st.divider()
     st.subheader(f"Candidatos para o sinal `{sinal_escolhido}`")
 
-    df_detalhe = carregar_sinal(sinal_escolhido)
+    df_detalhe = df_completo[df_completo["Sinal"] == sinal_escolhido].copy()
 
     if df_detalhe.empty:
         st.warning("Nenhum candidato encontrado para este sinal.")
     else:
-        # Destaque do melhor candidato
         melhor = df_detalhe[df_detalhe["Rank"] == 1]
         if not melhor.empty:
             nome_melhor  = melhor.iloc[0]["Candidato"]
@@ -233,7 +329,7 @@ if sinal_escolhido != opcao_todos:
             },
         )
 
-        # Gráfico comparativo — scores do instrumento (mais relevantes para o ranking)
+        # Gráfico comparativo
         if len(df_detalhe) > 1:
             cols_grafico = [
                 c for c in ["Score Fragmentacao", "Score Lab", "Isotope Similarity"]
@@ -250,4 +346,5 @@ if sinal_escolhido != opcao_todos:
 # Rodapé
 # ---------------------------------------------------------------------------
 st.divider()
-st.caption("Fonte: `vw_ranking_candidatos` | Banco: `banco_ist.db` | Pipeline: Omics ETL")
+view = "vw_ranking_historico" if batch_info else "vw_ranking_candidatos"
+st.caption(f"Fonte: `{view}` | Banco: `banco_ist.db` | Pipeline: Omics ETL")
