@@ -136,7 +136,7 @@ sinais = sorted(df_completo["Sinal"].dropna().unique().tolist())
 st.sidebar.header("Filtros")
 opcao_todos = "— Todos os sinais —"
 sinal_escolhido = st.sidebar.selectbox(
-    "Selecione um sinal analítico:",
+    "Filtrar por sinal analítico:",
     [opcao_todos] + sinais,
 )
 
@@ -169,8 +169,13 @@ score_col = "Score Ranking" if "Score Ranking" in df_completo.columns else "Scor
 # Card de resumo do batch (somente quando experimento histórico está selecionado)
 # ---------------------------------------------------------------------------
 if batch_info:
+    st.info(
+        f"**Visualizando Batch Histórico #{batch_info['id']}** — "
+        "os dados e rankings exibidos correspondem a este experimento específico. "
+        "Para retornar ao experimento mais recente, selecione **Mais recente** na sidebar."
+    )
     with st.container(border=True):
-        st.markdown(f"#### Batch #{batch_info['id']} — análise histórica")
+        st.markdown(f"#### Resumo do Batch #{batch_info['id']}")
         c1, c2, c3 = st.columns(3)
 
         data_raw = batch_info.get("iniciado_em") or ""
@@ -202,11 +207,11 @@ col1, col2, col3, col4 = st.columns(4)
 col1.metric("Total de sinais",     df_completo["Sinal"].nunique())
 col2.metric("Total de candidatos", len(df_completo))
 col3.metric(
-    f"{score_col} médio (rank 1)",
+    "Score médio (Rank 1)",
     f"{rank1[score_col].mean():.1f}" if not rank1.empty else "—",
 )
 col4.metric(
-    "Qualidade dados média",
+    "Completude de metadados",
     f"{df_completo['Score Qualidade Dados'].mean():.0f}%"
     if "Score Qualidade Dados" in df_completo.columns else "—",
 )
@@ -240,7 +245,7 @@ st.dataframe(
             format="%.1f",
         ),
         "Score Qualidade Dados": st.column_config.ProgressColumn(
-            "Score Qualidade Dados",
+            "Completude de Dados",
             help="% dos metadados externos preenchidos (PubChem / ChEBI) — não entra no ranking",
             min_value=0,
             max_value=100,

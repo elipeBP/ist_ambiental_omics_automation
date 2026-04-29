@@ -66,6 +66,8 @@ def _fmt_duracao(ini: str, fim: str) -> str:
         secs = int((t2 - t1).total_seconds())
         if secs < 0:
             return "—"
+        if secs == 0:
+            return "<1s"
         m, s = divmod(secs, 60)
         return f"{m}m {s:02d}s" if m else f"{s}s"
     except Exception:
@@ -97,14 +99,14 @@ col1, col2, col3, col4 = st.columns(4)
 col1.metric("Execuções registradas", len(batches))
 col2.metric("Com sucesso",           n_sucesso)
 col3.metric("Com falha",             n_falha)
-col4.metric("Sinais acumulados",     total_sinais if total_sinais else "—")
+col4.metric("Sinais processados",    total_sinais if total_sinais else "—")
 
 st.divider()
 
 # ---------------------------------------------------------------------------
 # Tabela principal
 # ---------------------------------------------------------------------------
-st.subheader("Todas as execuções")
+st.subheader(f"Execuções registradas ({len(batches)})")
 
 rows = []
 for b in batches:
@@ -141,7 +143,7 @@ if falhas:
 sucesso_list = [b for b in batches if b["status"] == "sucesso"]
 if sucesso_list:
     st.divider()
-    st.subheader("Abrir Ranking de um Experimento")
+    st.subheader("Navegar para Ranking")
 
     opcoes = {
         b["id"]: f"Batch #{b['id']} — {_fmt_data(b['iniciado_em'])} | {b['nome_ident']}"

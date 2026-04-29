@@ -29,6 +29,53 @@ st.caption("Envie os arquivos de identificação e abundância para processament
 st.divider()
 
 # ---------------------------------------------------------------------------
+# Seção de ajuda — colapsada por padrão para não poluir o fluxo principal
+# ---------------------------------------------------------------------------
+with st.expander("ℹ️ Como preparar os arquivos para upload", expanded=False):
+    col_h1, col_h2 = st.columns(2)
+
+    with col_h1:
+        st.markdown(
+            """
+            **Arquivo de Identificação** *(ex.: `IDENTIFICACAO.xlsx`)*
+
+            Exportado diretamente do software do equipamento LC-MS/MS.
+            Colunas **obrigatórias**:
+
+            | Coluna | Descrição |
+            |---|---|
+            | `Compound` | Código único do sinal analítico |
+            | `Description` | Nome do candidato molecular |
+
+            Colunas **opcionais** (melhoram o ranking quando presentes):
+
+            `Score`, `Mass Error (ppm)`, `Isotope Similarity`,
+            `Adducts`, `Neutral mass (Da)`, `Fragmentation score`
+            """
+        )
+
+    with col_h2:
+        st.markdown(
+            """
+            **Arquivo de Abundância** *(ex.: `ABUND.xlsx`)*
+
+            Contém as intensidades dos sinais medidos pelo instrumento.
+            Colunas **obrigatórias**:
+
+            | Coluna | Descrição |
+            |---|---|
+            | `Compound` | Código do sinal — deve ser idêntico ao arquivo de Identificação |
+            | `m/z` | Razão massa/carga medida |
+
+            > Os valores de `Compound` são usados para cruzar as duas planilhas.
+            > Verifique se ambos os arquivos pertencem ao **mesmo experimento**
+            > antes de fazer o upload.
+            """
+        )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
 # Etapa 1 — Upload dos arquivos
 # ---------------------------------------------------------------------------
 st.subheader("Etapa 1 — Selecionar arquivos")
@@ -44,7 +91,9 @@ with col_ident:
         key="upload_ident",
     )
     if arquivo_ident:
-        st.caption(f"✅ {arquivo_ident.name} ({arquivo_ident.size // 1024} KB)")
+        tam = arquivo_ident.size
+        tam_fmt = f"{tam / (1024*1024):.1f} MB" if tam >= 1024*1024 else f"{tam // 1024} KB"
+        st.caption(f"✅ {arquivo_ident.name} ({tam_fmt})")
     else:
         st.caption("Formatos aceitos: .xlsx, .xlsm, .xls, .csv · Máx. 50 MB")
 
@@ -57,7 +106,9 @@ with col_abund:
         key="upload_abund",
     )
     if arquivo_abund:
-        st.caption(f"✅ {arquivo_abund.name} ({arquivo_abund.size // 1024} KB)")
+        tam = arquivo_abund.size
+        tam_fmt = f"{tam / (1024*1024):.1f} MB" if tam >= 1024*1024 else f"{tam // 1024} KB"
+        st.caption(f"✅ {arquivo_abund.name} ({tam_fmt})")
     else:
         st.caption("Formatos aceitos: .xlsx, .xlsm, .xls, .csv · Máx. 50 MB")
 
