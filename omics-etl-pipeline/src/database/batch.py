@@ -54,7 +54,8 @@ def registrar_batch(
         if existente and existente[1] == "sucesso":
             raise BatchDuplicadoError(
                 f"Par de arquivos já processado com sucesso (batch_id={existente[0]}). "
-                "Nenhuma ação necessária."
+                "Nenhuma ação necessária.",
+                batch_id=existente[0],
             )
 
         cur.execute(

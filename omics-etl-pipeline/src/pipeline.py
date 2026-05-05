@@ -66,9 +66,8 @@ def executar_pipeline_com_job(job: PipelineJob) -> "int | None":
             nome_abund=job.nome_abund,
             fonte=job.fonte,
         )
-    except BatchDuplicadoError as e:
-        logger.info(f"Batch ignorado (duplicado): {e}")
-        return None
+    except BatchDuplicadoError:
+        raise  # chamador decide: CLI loga e ignora, UI exibe mensagem informativa
 
     atualizar_status_batch(batch_id, "executando")
 
@@ -87,23 +86,21 @@ def executar_pipeline_com_job(job: PipelineJob) -> "int | None":
 
         # 3c. Load
         logger.info(f"[Batch {batch_id}] Iniciando carga no banco...")
-        sucesso = carregar_dados_no_banco(df_transformado)
-        if not sucesso:
-            raise RuntimeError("Carga retornou falha (ver logs anteriores para detalhes).")
-
-        # Estatísticas para o registro de auditoria
-        total_sinais = int(df_transformado["compound_code"].nunique())
-        total_candidatos = len(df_transformado)
+        stats = carregar_dados_no_banco(df_transformado, batch_id=batch_id)
+        if stats["erros"] == -1:
+            raise RuntimeError("Erro crítico na carga (ver logs anteriores para detalhes).")
 
         atualizar_status_batch(
             batch_id,
             "sucesso",
-            total_sinais=total_sinais,
-            total_candidatos=total_candidatos,
+            total_sinais=stats["sinais"],
+            total_candidatos=stats["candidatos"],
+            total_moleculas_api=stats["moleculas_novas"],
         )
         logger.info(
             f"[Batch {batch_id}] Pipeline concluído: "
-            f"{total_sinais} sinais, {total_candidatos} candidatos."
+            f"{stats['sinais']} sinais, {stats['candidatos']} candidatos, "
+            f"{stats['moleculas_novas']} moléculas novas."
         )
         return batch_id
 

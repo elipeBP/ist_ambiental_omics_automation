@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import sqlite3
 from pathlib import Path
 
 import pandas as pd
@@ -56,6 +57,53 @@ def _aplicar_limite(df: pd.DataFrame) -> pd.DataFrame:
     return df_limitado
 
 
+def _carregar_cache_moleculas() -> dict:
+    """
+    Lê dim_molecula completo para memória como {nome: dados_api}.
+
+    Critério de "suficientemente enriquecida" (por API):
+      - PubChem: pubchem_cid is not None  → skip PubChem neste batch
+      - ChEBI  : chebi_id   is not None   → skip ChEBI neste batch
+
+    Moléculas com campo nulo foram inseridas mas a API falhou anteriormente
+    (erro de rede, molécula não indexada, etc.). Nesse caso a API é refeita
+    no próximo batch — tratamento automático de falhas transitórias.
+
+    Retorna {} se o banco ainda não existe (primeira execução).
+    """
+    from src.database.connection import DB_PATH
+
+    if not DB_PATH.exists():
+        return {}
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='dim_molecula'"
+            )
+            if not cur.fetchone():
+                return {}
+            cur.execute(
+                "SELECT nome, pubchem_cid, formula, peso_molecular, chebi_id, classe_quimica "
+                "FROM dim_molecula"
+            )
+            return {
+                nome: {
+                    "pubchem_cid":    cid,
+                    "formula":        formula,
+                    "peso_molecular": pm,
+                    "chebi_id":       chebi_id,
+                    "classe_quimica": classe or "Nao classificada",
+                }
+                for nome, cid, formula, pm, chebi_id, classe in cur.fetchall()
+            }
+    except Exception as exc:
+        logger.warning(
+            f"Cache de moléculas indisponível ({exc}) — todas as APIs serão consultadas."
+        )
+        return {}
+
+
 def enriquecer_dados_laboratorio(df_bruto: pd.DataFrame) -> pd.DataFrame:
     """
     Recebe o DataFrame consolidado da extração e produz o DataFrame de saída
@@ -65,18 +113,35 @@ def enriquecer_dados_laboratorio(df_bruto: pd.DataFrame) -> pd.DataFrame:
             Score, Fragmentation Score, Mass Error (ppm), Isotope Similarity,
             Neutral mass (Da), Adducts
 
-        Enriquecimento externo via APIs:
+        Enriquecimento externo via APIs (com cache cross-batch e intra-batch):
             PubChem  → CID, fórmula química, peso molecular
             ChEBI    → CHEBI ID e classes ontológicas (busca por nome)
+
+    Estratégia de cache:
+        1. Carrega dim_molecula em memória antes do loop (cross-batch).
+        2. Por molécula: se dados suficientes existem no cache → zero API calls.
+        3. Após primeira consulta de cada molécula, atualiza cache em memória
+           (intra-batch dedup: a mesma molécula nunca é consultada duas vezes
+           na mesma execução do pipeline, mesmo que apareça em N sinais).
 
     Limite por sinais únicos configurável via OMICS_MAX_COMPOSTOS.
     """
     df_bruto = _aplicar_limite(df_bruto)
 
-    total = len(df_bruto)
+    total    = len(df_bruto)
     n_sinais = df_bruto["Compound"].nunique() if "Compound" in df_bruto.columns else "?"
     logger.info(f"Iniciando enriquecimento: {total} candidatos em {n_sinais} sinais...")
 
+    # Cache cross-batch: carregado do banco uma vez por execução do pipeline
+    cache = _carregar_cache_moleculas()
+    logger.info(f"Cache cross-batch: {len(cache)} moléculas de execuções anteriores.")
+
+    # Sets de controle intra-batch: garantem que cada molécula única é
+    # consultada no máximo uma vez por execução, mesmo que apareça em vários sinais
+    pubchem_processadas: set = set()
+    chebi_processadas: set   = set()
+
+    hits_pubchem = hits_chebi = miss_pubchem = miss_chebi = 0
     dados_enriquecidos = []
 
     for i, (index, row) in enumerate(df_bruto.iterrows(), start=1):
@@ -86,7 +151,11 @@ def enriquecer_dados_laboratorio(df_bruto: pd.DataFrame) -> pd.DataFrame:
         retention_time = row.get("Retention time (min)")
 
         if i % _LOG_A_CADA == 0 or i == 1 or i == total:
-            logger.info(f"Progresso: {i}/{total} — sinal '{compound_code}'")
+            logger.info(
+                f"Progresso: {i}/{total} — sinal '{compound_code}' "
+                f"[PubChem hits={hits_pubchem}/calls={miss_pubchem} | "
+                f"ChEBI hits={hits_chebi}/calls={miss_chebi}]"
+            )
 
         # ------------------------------------------------------------------
         # Campos laboratoriais — capturados diretamente do dataset
@@ -99,22 +168,17 @@ def enriquecer_dados_laboratorio(df_bruto: pd.DataFrame) -> pd.DataFrame:
         neutral_mass_da    = row.get("Neutral mass (Da)")
         adducts            = row.get("Adducts")
 
-        # Estrutura base da linha enriquecida
         linha: dict = {
-            # Identificação do sinal
             "compound_code":      compound_code,
             "mz":                 mz,
             "retention_time":     retention_time,
-            # Identificação do candidato
             "description":        nome_molecula,
-            # Campos laboratoriais (dataset)
             "score_lab":          score_lab,
             "score_fragmentacao": score_fragmentacao,
             "mass_error_ppm":     mass_error_ppm,
             "score_isotopo":      score_isotopo,
             "neutral_mass_da":    neutral_mass_da,
             "adducts":            str(adducts).strip() if adducts and str(adducts) != "nan" else None,
-            # Campos de enriquecimento via API (preenchidos abaixo)
             "pubchem_cid":        None,
             "formula":            None,
             "peso_molecular":     None,
@@ -124,24 +188,81 @@ def enriquecer_dados_laboratorio(df_bruto: pd.DataFrame) -> pd.DataFrame:
 
         # ------------------------------------------------------------------
         # PubChem — fórmula, CID, peso molecular teórico
+        #
+        # Prioridade:
+        #   1. Cross-batch cache hit: pubchem_cid já existe em dim_molecula
+        #   2. Intra-batch hit: já consultado nesta execução (mesmo que sem dado)
+        #   3. Cache miss: primeira vez que esta molécula aparece → chama API
         # ------------------------------------------------------------------
-        resultado_pubchem = buscar_dados_pubchem(nome_molecula)
-        if resultado_pubchem:
-            linha["pubchem_cid"]    = resultado_pubchem.get("pubchem_cid")
-            linha["formula"]        = resultado_pubchem.get("formula_quimica")
-            linha["peso_molecular"] = resultado_pubchem.get("peso_molecular")
+        c = cache.get(nome_molecula, {})
+        if c.get("pubchem_cid") is not None:
+            # Cache hit: dados completos do PubChem já disponíveis
+            linha["pubchem_cid"]    = c["pubchem_cid"]
+            linha["formula"]        = c.get("formula")
+            linha["peso_molecular"] = c.get("peso_molecular")
+            hits_pubchem += 1
+        elif nome_molecula not in pubchem_processadas:
+            # Cache miss: primeira ocorrência desta molécula → consulta PubChem
+            resultado_pubchem = buscar_dados_pubchem(nome_molecula)
+            miss_pubchem += 1
+            if resultado_pubchem:
+                linha["pubchem_cid"]    = resultado_pubchem.get("pubchem_cid")
+                linha["formula"]        = resultado_pubchem.get("formula_quimica")
+                linha["peso_molecular"] = resultado_pubchem.get("peso_molecular")
+            # Atualiza cache em memória para ocorrências subsequentes neste batch
+            cache.setdefault(nome_molecula, {}).update({
+                "pubchem_cid":    linha["pubchem_cid"],
+                "formula":        linha["formula"],
+                "peso_molecular": linha["peso_molecular"],
+            })
+            pubchem_processadas.add(nome_molecula)
+        else:
+            # Intra-batch hit: já consultado nesta execução, reutiliza resultado
+            c2 = cache[nome_molecula]
+            linha["pubchem_cid"]    = c2.get("pubchem_cid")
+            linha["formula"]        = c2.get("formula")
+            linha["peso_molecular"] = c2.get("peso_molecular")
+            hits_pubchem += 1
 
         # ------------------------------------------------------------------
         # ChEBI — classes ontológicas (busca por nome, sem ID hardcoded)
+        #
+        # Mesma prioridade de cache que o PubChem, avaliada de forma independente:
+        # uma molécula pode ter cache hit no PubChem mas miss no ChEBI (se a
+        # consulta ChEBI falhou na execução anterior por erro de rede).
         # ------------------------------------------------------------------
-        resultado_chebi = buscar_ontologia_chebi(nome_molecula)
-        if resultado_chebi:
-            linha["chebi_id"]       = resultado_chebi.get("chebi_id")
-            linha["classe_quimica"] = resultado_chebi.get("classes_ontologicas", "Nao classificada")
+        c = cache.get(nome_molecula, {})
+        if c.get("chebi_id") is not None:
+            linha["chebi_id"]       = c["chebi_id"]
+            linha["classe_quimica"] = c.get("classe_quimica", "Nao classificada")
+            hits_chebi += 1
+        elif nome_molecula not in chebi_processadas:
+            resultado_chebi = buscar_ontologia_chebi(nome_molecula)
+            miss_chebi += 1
+            if resultado_chebi:
+                linha["chebi_id"]       = resultado_chebi.get("chebi_id")
+                linha["classe_quimica"] = resultado_chebi.get("classes_ontologicas", "Nao classificada")
+            cache.setdefault(nome_molecula, {}).update({
+                "chebi_id":       linha["chebi_id"],
+                "classe_quimica": linha["classe_quimica"],
+            })
+            chebi_processadas.add(nome_molecula)
+        else:
+            c2 = cache[nome_molecula]
+            linha["chebi_id"]       = c2.get("chebi_id")
+            linha["classe_quimica"] = c2.get("classe_quimica", "Nao classificada")
+            hits_chebi += 1
 
         dados_enriquecidos.append(linha)
 
-    logger.info(f"Enriquecimento concluido: {len(dados_enriquecidos)} registros processados.")
+    total_hits  = hits_pubchem + hits_chebi
+    total_calls = miss_pubchem + miss_chebi
+    logger.info(
+        f"Enriquecimento concluído: {len(dados_enriquecidos)} candidatos | "
+        f"PubChem: {hits_pubchem} hits / {miss_pubchem} chamadas | "
+        f"ChEBI: {hits_chebi} hits / {miss_chebi} chamadas | "
+        f"Total: {total_calls} chamadas reais, {total_hits} evitadas."
+    )
     return pd.DataFrame(dados_enriquecidos)
 
 

@@ -11,8 +11,7 @@ from src.database.connection import DB_PATH
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Tabela 0 — Controle de execuções do pipeline (rastreabilidade / auditoria)
-#   Uma linha por invocação. hash_ident+hash_abund previne reprocessamento.
+# Tabela 0 — Controle de execuções (rastreabilidade / auditoria)
 # ---------------------------------------------------------------------------
 SQL_BATCH_EXECUCAO = """
 CREATE TABLE IF NOT EXISTS batch_execucao (
@@ -30,8 +29,8 @@ CREATE TABLE IF NOT EXISTS batch_execucao (
     total_candidatos    INTEGER,
     total_moleculas_api INTEGER,
     erro_mensagem       TEXT
-    -- Sem UNIQUE no par de hashes: a regra "não reprocessar sucesso" é
-    -- aplicada no código (registrar_batch). Isso permite retentar após falha.
+    -- Deduplicação por hash feita em código (batch.py), não por constraint de DB.
+    -- Isso permite retry após falha sem violar unicidade.
 );
 """
 
@@ -42,20 +41,26 @@ CREATE INDEX IF NOT EXISTS idx_batch_status
 
 # ---------------------------------------------------------------------------
 # Tabela 1 — Sinal analítico bruto do equipamento
+#   compound_code único por batch (mesmo composto pode aparecer em experimentos
+#   diferentes). batch_id é FK para batch_execucao.
 # ---------------------------------------------------------------------------
 SQL_FACT_SINAL = """
 CREATE TABLE IF NOT EXISTS fact_sinal (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    compound_code  TEXT NOT NULL UNIQUE,
-    mz             REAL NOT NULL,
-    retention_time REAL,
-    abundancia     REAL,
-    data_insercao  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        INTEGER NOT NULL REFERENCES batch_execucao(id),
+    compound_code   TEXT NOT NULL,
+    mz              REAL NOT NULL,
+    retention_time  REAL,
+    abundancia      REAL,
+    data_insercao   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(compound_code, batch_id)
 );
 """
 
 # ---------------------------------------------------------------------------
-# Tabela 2 — Moléculas candidatas (enriquecidas pelas APIs)
+# Tabela 2 — Moléculas candidatas (cache global de API)
+#   nome UNIQUE globalmente: a mesma molécula não é consultada duas vezes
+#   no PubChem/ChEBI, independente do batch em que aparecer (Fase 3).
 # ---------------------------------------------------------------------------
 SQL_DIM_MOLECULA = """
 CREATE TABLE IF NOT EXISTS dim_molecula (
@@ -72,37 +77,45 @@ CREATE TABLE IF NOT EXISTS dim_molecula (
 """
 
 # ---------------------------------------------------------------------------
-# Tabela 3 — Relação N:N sinal ↔ candidato com scores e dados laboratoriais
+# Tabela 3 — Relação N:N sinal ↔ candidato (com scores e dados laboratoriais)
+#   batch_id desnormalizado: permite filtrar candidatos por batch sem JOIN
+#   extra através de fact_sinal. O UNIQUE(sinal_id, molecula_id) é
+#   implicitamente scoped por batch pois sinal_id já aponta para um sinal
+#   de um batch específico.
 #
-# Campos laboratoriais (do software do equipamento, via IDENTIFICACAO.xlsx):
-#   score_lab          — Score calculado pelo software
-#   score_fragmentacao — Fragmentation Score (MS/MS matching)
-#   mass_error_ppm     — Mass Error em ppm (precisão analítica real)
-#   score_isotopo      — Isotope Similarity (padrão isotópico)
-#   neutral_mass_da    — Neutral mass (Da) por candidato, já com correção de aducto
-#   adducts            — Tipo de aducto detectado ([M+H]+, [M-H]-, etc.)
+#   score_ranking:      média ponderada linear dos scores do instrumento +
+#                       score_massa ppm. Determina rank_posicao.
+#                       Pesos: fragmentação 40% | lab 30% | isotopo 20% | massa 10%.
+#                       PROVISÓRIO — calibrar com IST (ver load.py: W_FRAG etc.)
 #
-# Campos de scoring interno (calculados pelo pipeline):
-#   score_massa        — Baseado no desvio de massa (transitório até validação IST)
-#   score_metadata     — Baseado na completude dos dados das APIs
-#   score_total        — Soma ponderada (fórmula final a definir com IST)
+#   score_data_quality: % dos campos de metadados externos preenchidos (0–100).
+#                       NÃO entra no ranking — indicador de completude de dados.
+#
+#   score_total:        alias de backward compatibility para score_ranking.
+#   score_metadata:     alias de backward compatibility para score_data_quality.
 # ---------------------------------------------------------------------------
 SQL_CANDIDATO_SINAL = """
 CREATE TABLE IF NOT EXISTS candidato_sinal (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id           INTEGER NOT NULL REFERENCES batch_execucao(id),
     sinal_id           INTEGER NOT NULL REFERENCES fact_sinal(id),
     molecula_id        INTEGER NOT NULL REFERENCES dim_molecula(id),
-    -- Dados laboratoriais do equipamento
+    -- Dados laboratoriais do equipamento (IDENTIFICACAO.xlsx)
     score_lab          REAL,
     score_fragmentacao REAL,
     mass_error_ppm     REAL,
     score_isotopo      REAL,
     neutral_mass_da    REAL,
     adducts            TEXT,
-    -- Scores internos do pipeline
+    -- Componente de erro de massa (0–40, calculado pelo pipeline)
     score_massa        REAL DEFAULT 0,
-    score_metadata     REAL DEFAULT 0,
+    -- Score de ranking: média ponderada linear (0–100) — determina rank_posicao
+    score_ranking      REAL DEFAULT 0,
+    -- Score de qualidade de dados: completude dos metadados externos (0–100%)
+    score_data_quality REAL DEFAULT 0,
+    -- Aliases de backward compatibility (= score_ranking e score_data_quality)
     score_total        REAL DEFAULT 0,
+    score_metadata     REAL DEFAULT 0,
     rank_posicao       INTEGER,
     data_calculo       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(sinal_id, molecula_id)
@@ -117,107 +130,141 @@ CREATE INDEX IF NOT EXISTS idx_compound_code
     ON fact_sinal (compound_code);
 """
 
+SQL_INDICE_SINAL_BATCH = """
+CREATE INDEX IF NOT EXISTS idx_sinal_batch
+    ON fact_sinal (batch_id);
+"""
+
 SQL_INDICE_RANK = """
 CREATE INDEX IF NOT EXISTS idx_candidato_rank
     ON candidato_sinal (sinal_id, rank_posicao);
 """
 
+SQL_INDICE_CANDIDATO_BATCH = """
+CREATE INDEX IF NOT EXISTS idx_candidato_batch
+    ON candidato_sinal (batch_id);
+"""
+
 # ---------------------------------------------------------------------------
-# View final — exposição completa para o dashboard
-# Inclui campos laboratoriais e scores internos lado a lado.
-# A ponderação final do score_total será definida com o IST.
+# View principal — batch mais recente com sucesso
+#   Substitui a view anterior. Streamlit continua funcionando sem alterações
+#   pois todas as colunas antigas estão presentes; Batch ID e Data Execucao
+#   são colunas extras ignoradas pelo código existente.
 # ---------------------------------------------------------------------------
 SQL_VIEW_RANKING = """
 CREATE VIEW vw_ranking_candidatos AS
 SELECT
-    s.compound_code      AS "Sinal",
-    s.mz                 AS "m/z Medido",
-    m.nome               AS "Candidato",
-    m.formula            AS "Formula",
-    m.peso_molecular     AS "Peso Teorico",
-    m.classe_quimica     AS "Classe Quimica",
-    c.adducts            AS "Adducts",
-    c.neutral_mass_da    AS "Neutral Mass (Da)",
-    c.score_lab          AS "Score Lab",
-    c.score_fragmentacao AS "Score Fragmentacao",
-    c.mass_error_ppm     AS "Mass Error (ppm)",
-    c.score_isotopo      AS "Isotope Similarity",
-    c.score_massa        AS "Score Massa",
-    c.score_metadata     AS "Score Metadata",
-    c.score_total        AS "Score Total",
-    c.rank_posicao       AS "Rank"
+    b.id                   AS "Batch ID",
+    b.iniciado_em          AS "Data Execucao",
+    s.compound_code        AS "Sinal",
+    s.mz                   AS "m/z Medido",
+    m.nome                 AS "Candidato",
+    m.formula              AS "Formula",
+    m.peso_molecular       AS "Peso Teorico",
+    m.classe_quimica       AS "Classe Quimica",
+    c.adducts              AS "Adducts",
+    c.neutral_mass_da      AS "Neutral Mass (Da)",
+    c.score_lab            AS "Score Lab",
+    c.score_fragmentacao   AS "Score Fragmentacao",
+    c.mass_error_ppm       AS "Mass Error (ppm)",
+    c.score_isotopo        AS "Isotope Similarity",
+    c.score_massa          AS "Score Massa",
+    c.score_ranking        AS "Score Ranking",
+    c.score_data_quality   AS "Score Qualidade Dados",
+    c.score_ranking        AS "Score Total",
+    c.rank_posicao         AS "Rank"
 FROM candidato_sinal c
-JOIN fact_sinal   s ON c.sinal_id   = s.id
-JOIN dim_molecula m ON c.molecula_id = m.id
+JOIN fact_sinal      s ON c.sinal_id    = s.id
+JOIN dim_molecula    m ON c.molecula_id = m.id
+JOIN batch_execucao  b ON c.batch_id    = b.id
+WHERE b.id = (SELECT MAX(id) FROM batch_execucao WHERE status = 'sucesso')
 ORDER BY s.compound_code, c.rank_posicao;
 """
 
 # ---------------------------------------------------------------------------
-# Colunas laboratoriais adicionadas nesta versão.
-# Usadas pela função de migração para bancos já existentes.
+# View histórica — todos os batches com sucesso
+#   Usada pelo seletor de batch histórico na UI (Fase 4).
 # ---------------------------------------------------------------------------
-_MIGRACOES_CANDIDATO = [
-    ("score_lab",          "REAL"),
-    ("score_fragmentacao", "REAL"),
-    ("mass_error_ppm",     "REAL"),
-    ("score_isotopo",      "REAL"),
-    ("neutral_mass_da",    "REAL"),
-    ("adducts",            "TEXT"),
-]
-
-
-def _migrar_candidato_sinal(conn: sqlite3.Connection) -> None:
-    """
-    Adiciona as colunas laboratoriais ao candidato_sinal se ainda não existirem.
-    Seguro para re-execução — ALTER TABLE falha silenciosamente se a coluna já existe.
-    """
-    cur = conn.cursor()
-    for col_nome, col_tipo in _MIGRACOES_CANDIDATO:
-        try:
-            cur.execute(
-                f"ALTER TABLE candidato_sinal ADD COLUMN {col_nome} {col_tipo}"
-            )
-            logger.info(f"Migração: candidato_sinal.{col_nome} adicionada.")
-        except sqlite3.OperationalError:
-            pass  # Coluna já existe — comportamento esperado em re-execuções
+SQL_VIEW_HISTORICO = """
+CREATE VIEW vw_ranking_historico AS
+SELECT
+    b.id                   AS "Batch ID",
+    b.iniciado_em          AS "Data Execucao",
+    b.nome_ident           AS "Arquivo Ident",
+    b.nome_abund           AS "Arquivo Abund",
+    s.compound_code        AS "Sinal",
+    s.mz                   AS "m/z Medido",
+    m.nome                 AS "Candidato",
+    m.formula              AS "Formula",
+    m.peso_molecular       AS "Peso Teorico",
+    m.classe_quimica       AS "Classe Quimica",
+    c.adducts              AS "Adducts",
+    c.neutral_mass_da      AS "Neutral Mass (Da)",
+    c.score_lab            AS "Score Lab",
+    c.score_fragmentacao   AS "Score Fragmentacao",
+    c.mass_error_ppm       AS "Mass Error (ppm)",
+    c.score_isotopo        AS "Isotope Similarity",
+    c.score_massa          AS "Score Massa",
+    c.score_ranking        AS "Score Ranking",
+    c.score_data_quality   AS "Score Qualidade Dados",
+    c.score_ranking        AS "Score Total",
+    c.rank_posicao         AS "Rank"
+FROM candidato_sinal c
+JOIN fact_sinal      s ON c.sinal_id    = s.id
+JOIN dim_molecula    m ON c.molecula_id = m.id
+JOIN batch_execucao  b ON c.batch_id    = b.id
+WHERE b.status = 'sucesso'
+ORDER BY b.id DESC, s.compound_code, c.rank_posicao;
+"""
 
 
 def criar_tabelas() -> None:
     """
-    Cria o schema completo do banco e aplica migrações necessárias.
+    Inicializa o schema completo e aplica migrações se necessário.
 
-    Seguro para re-execução:
-    - Tabelas: CREATE IF NOT EXISTS (não sobrescreve dados)
-    - Colunas novas: ALTER TABLE (ignorado se já existe)
-    - View: DROP + CREATE (sempre atualizada para refletir o schema atual)
+    Ordem de operações:
+        1. Migração v1→v2 (se banco existente ainda não tem batch_id).
+        2. CREATE IF NOT EXISTS de todas as tabelas (idempotente).
+        3. DROP + CREATE das views (sempre refletem o schema atual).
+
+    Seguro para re-execução em qualquer estado do banco.
     """
+    from src.database.migrate import migrar_v1_para_v2, migrar_v2_para_v3
+
     logger.info("Inicializando schema do banco de dados...")
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON;")
 
     try:
+        # Migrações executadas antes das CREATE IF NOT EXISTS para garantir
+        # que o schema atual cobre todas as colunas esperadas pelo DDL.
         cur = conn.cursor()
-
-        # Tabelas base (idempotentes)
         cur.execute(SQL_BATCH_EXECUCAO)
         cur.execute(SQL_INDICE_BATCH_STATUS)
+        conn.commit()
+
+        migrar_v1_para_v2(conn)   # batch_id em fact_sinal / candidato_sinal
+        migrar_v2_para_v3(conn)   # score_ranking / score_data_quality
+
+        # Tabelas restantes (idempotentes)
         cur.execute(SQL_FACT_SINAL)
         cur.execute(SQL_DIM_MOLECULA)
         cur.execute(SQL_CANDIDATO_SINAL)
         cur.execute(SQL_INDICE_SINAL)
+        cur.execute(SQL_INDICE_SINAL_BATCH)
         cur.execute(SQL_INDICE_RANK)
+        cur.execute(SQL_INDICE_CANDIDATO_BATCH)
 
-        # Migração: adiciona colunas laboratoriais se o banco é pré-existente
-        _migrar_candidato_sinal(conn)
-
-        # View: sempre recriada para garantir que reflete o schema atual
+        # Views: sempre recriadas para refletir o schema atual
         cur.execute("DROP VIEW IF EXISTS vw_ranking_candidatos")
+        cur.execute("DROP VIEW IF EXISTS vw_ranking_historico")
         cur.execute(SQL_VIEW_RANKING)
+        cur.execute(SQL_VIEW_HISTORICO)
 
         conn.commit()
         logger.info(
             "Schema OK: batch_execucao | fact_sinal | dim_molecula "
-            "| candidato_sinal | vw_ranking_candidatos"
+            "| candidato_sinal | vw_ranking_candidatos | vw_ranking_historico"
         )
     except sqlite3.Error as e:
         logger.error(f"Erro ao criar schema: {e}")
