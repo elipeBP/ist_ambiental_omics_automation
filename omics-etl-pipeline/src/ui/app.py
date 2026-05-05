@@ -41,13 +41,9 @@ st.divider()
 # Guarda de estado: banco inexistente
 # ---------------------------------------------------------------------------
 if not db_existe():
-    st.warning(
-        "Banco de dados não encontrado. "
-        "Execute o pipeline primeiro:\n\n"
-        "```bash\n"
-        "cd omics-etl-pipeline\n"
-        "python main.py\n"
-        "```"
+    st.info(
+        "Banco de dados não encontrado.  \n"
+        "Use a página **📤 Carregar Dados** para processar o primeiro experimento."
     )
     st.stop()
 
@@ -122,16 +118,25 @@ else:
     batch_info  = next((b for b in batches_sucesso if b["id"] == batch_sel_id), None)
 
 if df_completo.empty:
-    st.info(
-        "A view de ranking não retornou dados. "
-        "Verifique se o pipeline foi executado com sucesso (`python main.py`)."
-    )
+    if batch_sel_id is not None:
+        st.warning(
+            f"Nenhum dado encontrado para o **Batch #{batch_sel_id}**.  \n"
+            "O batch pode não ter sido concluído com sucesso."
+        )
+    else:
+        st.info(
+            "Nenhum experimento processado ainda.  \n"
+            "Use a página **📤 Carregar Dados** para processar um experimento."
+        )
     st.stop()
 
 # ---------------------------------------------------------------------------
 # Sidebar — filtro por sinal (depende dos dados carregados)
 # ---------------------------------------------------------------------------
-sinais = sorted(df_completo["Sinal"].dropna().unique().tolist())
+try:
+    sinais = sorted(df_completo["Sinal"].dropna().unique().tolist())
+except KeyError:
+    sinais = []
 
 st.sidebar.header("Filtros")
 opcao_todos = "— Todos os sinais —"
@@ -159,6 +164,9 @@ with st.sidebar.expander("ℹ️ Sobre o Score Ranking", expanded=False):
         externos (PubChem / ChEBI). Não entra no ranking.
         """
     )
+
+st.sidebar.divider()
+st.sidebar.caption("Omics ETL Pipeline · IST Ambiental / SENAI")
 
 # ---------------------------------------------------------------------------
 # Detecção da coluna de score (backward compat)
@@ -326,8 +334,8 @@ if sinal_escolhido != opcao_todos:
                     min_value=0, max_value=100, format="%.0f%%",
                 ),
                 "Score Massa": st.column_config.NumberColumn(
-                    "Score Massa (ppm)",
-                    help="Componente do erro de massa em ppm (0–40) — contribui 10% no Score Ranking",
+                    "Score Massa",
+                    help="Pontuação do erro de massa (0–40 pontos): máximo quando erro ≤ 5 ppm, zero quando ≥ 20 ppm. Contribui 10% no Score Ranking.",
                     format="%.2f",
                 ),
                 "Rank": st.column_config.NumberColumn("Rank"),
@@ -342,10 +350,13 @@ if sinal_escolhido != opcao_todos:
             ]
             if cols_grafico:
                 st.markdown("**Comparativo visual — scores do instrumento** *(componentes primários do ranking)*")
-                st.bar_chart(
-                    df_detalhe.set_index("Candidato")[cols_grafico],
-                    use_container_width=True,
-                )
+                try:
+                    st.bar_chart(
+                        df_detalhe.set_index("Candidato")[cols_grafico],
+                        use_container_width=True,
+                    )
+                except Exception:
+                    pass  # gráfico não crítico — omite sem quebrar a página
 
 # ---------------------------------------------------------------------------
 # Rodapé

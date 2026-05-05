@@ -8,10 +8,13 @@ Views disponíveis:
   vw_ranking_candidatos  → batch mais recente com sucesso (uso padrão)
   vw_ranking_historico   → todos os batches com sucesso (seletor histórico)
 """
+import logging
 import sqlite3
 from pathlib import Path
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 _BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DB_PATH   = _BASE_DIR / "banco_ist.db"
@@ -32,7 +35,8 @@ def carregar_ranking() -> pd.DataFrame:
     try:
         conn = sqlite3.connect(DB_PATH)
         return pd.read_sql_query('SELECT * FROM "vw_ranking_candidatos"', conn)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Erro ao carregar ranking: {e}")
         return pd.DataFrame()
     finally:
         if "conn" in locals():
@@ -53,7 +57,8 @@ def carregar_sinal(sinal: str) -> pd.DataFrame:
             conn,
             params=(sinal,),
         )
-    except Exception:
+    except Exception as e:
+        logger.error(f"Erro ao carregar sinal '{sinal}': {e}")
         return pd.DataFrame()
     finally:
         if "conn" in locals():
@@ -86,7 +91,8 @@ def carregar_ranking_batch(batch_id: int) -> pd.DataFrame:
             conn,
             params=(batch_id,),
         )
-    except Exception:
+    except Exception as e:
+        logger.error(f"Erro ao carregar ranking do batch {batch_id}: {e}")
         return pd.DataFrame()
     finally:
         if "conn" in locals():

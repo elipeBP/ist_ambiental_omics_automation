@@ -196,7 +196,7 @@ if arquivo_ident and arquivo_abund:
                     resultado = {"tipo": "sucesso", "batch_id": batch_id_resultado}
                 else:
                     status.update(label="Pipeline não concluído", state="error")
-                    resultado = {"tipo": "erro", "msg": "Erro durante o processamento — verifique os logs do servidor."}
+                    resultado = {"tipo": "erro", "msg": "O pipeline não foi concluído com sucesso. Verifique se os arquivos estão corretos e tente novamente."}
 
             except BatchDuplicadoError as e:
                 status.update(label="Arquivos já processados anteriormente", state="complete")
@@ -204,7 +204,11 @@ if arquivo_ident and arquivo_abund:
 
             except Exception as e:
                 status.update(label="Erro inesperado", state="error")
-                resultado = {"tipo": "erro", "msg": str(e)}
+                msg = str(e)
+                # Garante mensagem legível mesmo para erros técnicos longos
+                if len(msg) > 500:
+                    msg = msg[:500] + "..."
+                resultado = {"tipo": "erro", "msg": msg}
 
         if resultado:
             st.session_state["resultado_upload"] = resultado

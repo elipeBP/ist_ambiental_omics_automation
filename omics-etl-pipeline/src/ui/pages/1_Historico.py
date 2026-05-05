@@ -41,7 +41,7 @@ batches = _batches()
 if not batches:
     st.info(
         "Nenhuma execução registrada ainda.  \n"
-        "Execute `python main.py` ou use a página **Carregar Dados** para processar um experimento."
+        "Use a página **📤 Carregar Dados** para processar o primeiro experimento."
     )
     st.stop()
 
