@@ -33,8 +33,8 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 # Cabeçalho
 # ---------------------------------------------------------------------------
-st.title("🧬 Ranking de Candidatos Moleculares")
-st.caption("Sistema de apoio à decisão para identificação de compostos | IST Ambiental / SENAI")
+st.title("🧬 Identificação de Compostos — Resultados")
+st.caption("Candidatos moleculares sugeridos pelo instrumento, organizados por plausibilidade de identificação | IST Ambiental / SENAI")
 st.divider()
 
 # ---------------------------------------------------------------------------
@@ -42,8 +42,8 @@ st.divider()
 # ---------------------------------------------------------------------------
 if not db_existe():
     st.info(
-        "Banco de dados não encontrado.  \n"
-        "Use a página **📤 Carregar Dados** para processar o primeiro experimento."
+        "Nenhuma análise encontrada.  \n"
+        "Use a página **📤 Nova Análise** para processar o primeiro experimento."
     )
     st.stop()
 
@@ -59,9 +59,9 @@ batches_todos   = _listar_batches_ui()
 batches_sucesso = [b for b in batches_todos if b["status"] == "sucesso"]
 
 # ---------------------------------------------------------------------------
-# Sidebar — seletor de experimento (batch)
+# Sidebar — seletor de análise
 # ---------------------------------------------------------------------------
-st.sidebar.header("Experimento")
+st.sidebar.header("Análise")
 
 # Recebe navegação de outras páginas (Histórico / Carregar Dados)
 _ir_para = st.session_state.pop("ir_para_batch", None)
@@ -76,7 +76,7 @@ def _label_batch(bid: "int | None") -> str:
         return f"Mais recente{sufixo}"
     b = next((x for x in batches_sucesso if x["id"] == bid), None)
     if not b:
-        return f"Batch #{bid}"
+        return f"Análise #{bid}"
     data = (b["iniciado_em"] or "")[:10]
     nome = b["nome_ident"]
     if len(nome) > 22:
@@ -89,10 +89,11 @@ if _ir_para is not None and _ir_para in opcoes_ids:
     idx_default = opcoes_ids.index(_ir_para)
 
 batch_sel_id = st.sidebar.selectbox(
-    "Selecione o experimento:",
+    "Selecionar análise:",
     options=opcoes_ids,
     index=idx_default,
     format_func=_label_batch,
+    help="Selecione um experimento para visualizar os resultados. 'Mais recente' exibe o último processado com sucesso.",
 )
 
 st.sidebar.divider()
@@ -120,18 +121,18 @@ else:
 if df_completo.empty:
     if batch_sel_id is not None:
         st.warning(
-            f"Nenhum dado encontrado para o **Batch #{batch_sel_id}**.  \n"
-            "O batch pode não ter sido concluído com sucesso."
+            f"Nenhum resultado encontrado para a **Análise #{batch_sel_id}**.  \n"
+            "A análise pode não ter sido concluída com sucesso."
         )
     else:
         st.info(
             "Nenhum experimento processado ainda.  \n"
-            "Use a página **📤 Carregar Dados** para processar um experimento."
+            "Use a página **📤 Nova Análise** para processar um experimento."
         )
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Sidebar — filtro por sinal (depende dos dados carregados)
+# Sidebar — filtro por composto (depende dos dados carregados)
 # ---------------------------------------------------------------------------
 try:
     sinais = sorted(df_completo["Sinal"].dropna().unique().tolist())
@@ -139,34 +140,43 @@ except KeyError:
     sinais = []
 
 st.sidebar.header("Filtros")
-opcao_todos = "— Todos os sinais —"
+opcao_todos = "— Todos os compostos —"
 sinal_escolhido = st.sidebar.selectbox(
-    "Filtrar por sinal analítico:",
+    "Filtrar por composto detectado:",
     [opcao_todos] + sinais,
+    help="Selecione um composto para ver todos os seus candidatos moleculares em detalhe.",
 )
 
-with st.sidebar.expander("ℹ️ Sobre o Score Ranking", expanded=False):
+with st.sidebar.expander("ℹ️ Como interpretar a pontuação", expanded=False):
     st.markdown(
         """
-        **Score Ranking** (0–100) — média ponderada dos scores de identificação:
+        **Pontuação de identificação** (0–100)
 
-        | Componente | Peso | Fonte |
-        |---|---|---|
-        | Fragmentação MS/MS | **40%** | Instrumento |
-        | Score Lab | **30%** | Instrumento |
-        | Similaridade Isotópica | **20%** | Instrumento |
-        | Erro de Massa (ppm) | **10%** | Pipeline |
+        Calculada a partir dos dados do instrumento LC-MS/MS.
+        Candidatos com pontuação mais alta correspondem melhor
+        ao sinal medido — são os mais *prováveis*, não os confirmados.
 
-        *Pesos provisórios — calibráveis pelo IST.*
+        O instrumento avalia automaticamente:
+        - Coincidência com o padrão de fragmentação MS/MS
+        - Semelhança com o padrão isotópico esperado
+        - Precisão do erro de massa
 
         ---
-        **Score Qualidade Dados** (0–100%) — completude dos metadados
-        externos (PubChem / ChEBI). Não entra no ranking.
+        **Dados externos disponíveis** (0–100%)
+
+        Indica quantas informações sobre o candidato foram
+        encontradas em bases públicas (PubChem, ChEBI).
+        **Não afeta o ranking** — é um indicador de quão bem
+        documentada é a molécula na literatura científica.
+
+        ---
+        ⚠️ *Os resultados devem ser validados por especialista
+        antes de reportar uma identificação definitiva.*
         """
     )
 
 st.sidebar.divider()
-st.sidebar.caption("Omics ETL Pipeline · IST Ambiental / SENAI")
+st.sidebar.caption("Omics ETL · IST Ambiental / SENAI")
 
 # ---------------------------------------------------------------------------
 # Detecção da coluna de score (backward compat)
@@ -174,16 +184,16 @@ st.sidebar.caption("Omics ETL Pipeline · IST Ambiental / SENAI")
 score_col = "Score Ranking" if "Score Ranking" in df_completo.columns else "Score Total"
 
 # ---------------------------------------------------------------------------
-# Card de resumo do batch (somente quando experimento histórico está selecionado)
+# Card de resumo da análise histórica (somente quando selecionado)
 # ---------------------------------------------------------------------------
 if batch_info:
     st.info(
-        f"**Visualizando Batch Histórico #{batch_info['id']}** — "
-        "os dados e rankings exibidos correspondem a este experimento específico. "
-        "Para retornar ao experimento mais recente, selecione **Mais recente** na sidebar."
+        f"**Visualizando Análise Histórica #{batch_info['id']}** — "
+        "os resultados exibidos correspondem a este experimento específico. "
+        "Para retornar à análise mais recente, selecione **Mais recente** na barra lateral."
     )
     with st.container(border=True):
-        st.markdown(f"#### Resumo do Batch #{batch_info['id']}")
+        st.markdown(f"#### Análise #{batch_info['id']}")
         c1, c2, c3 = st.columns(3)
 
         data_raw = batch_info.get("iniciado_em") or ""
@@ -200,31 +210,73 @@ if batch_info:
         cand_n   = batch_info.get("total_candidatos")
         apis_n   = batch_info.get("total_moleculas_api")
         c3.markdown(
-            f"**{sinais_n if sinais_n is not None else '—'}** sinais · "
+            f"**{sinais_n if sinais_n is not None else '—'}** compostos detectados · "
             f"**{cand_n if cand_n is not None else '—'}** candidatos · "
-            f"**{apis_n if apis_n is not None else '—'}** novas moléculas"
+            f"**{apis_n if apis_n is not None else '—'}** moléculas buscadas online"
         )
     st.divider()
 
 # ---------------------------------------------------------------------------
-# Métricas resumidas (topo da página)
+# Métricas resumidas
 # ---------------------------------------------------------------------------
 rank1 = df_completo[df_completo["Rank"] == 1]
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Total de sinais",     df_completo["Sinal"].nunique())
-col2.metric("Total de candidatos", len(df_completo))
+col1.metric(
+    "Compostos detectados",
+    df_completo["Sinal"].nunique(),
+    help="Número de sinais analíticos únicos identificados pelo instrumento neste experimento",
+)
+col2.metric(
+    "Identidades sugeridas",
+    len(df_completo),
+    help="Total de candidatos moleculares listados para todos os compostos detectados",
+)
 col3.metric(
-    "Score médio (Rank 1)",
+    "Confiança média (Rank 1)",
     f"{rank1[score_col].mean():.1f}" if not rank1.empty else "—",
+    help="Pontuação média de identificação dos candidatos mais prováveis (Rank 1) de cada composto",
 )
 col4.metric(
-    "Completude de metadados",
+    "Dados externos disponíveis",
     f"{df_completo['Score Qualidade Dados'].mean():.0f}%"
     if "Score Qualidade Dados" in df_completo.columns else "—",
+    help="Percentual médio de informações encontradas em bases públicas (PubChem, ChEBI) para os candidatos",
 )
 
 st.divider()
+
+# ---------------------------------------------------------------------------
+# Fluxo conceitual — contexto para novos usuários
+# ---------------------------------------------------------------------------
+with st.expander("ℹ️ Como interpretar estes resultados", expanded=False):
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        with st.container(border=True):
+            st.markdown("**🔬 Instrumento LC-MS/MS**")
+            st.caption(
+                "Detecta sinais na amostra e, para cada um, sugere compostos candidatos "
+                "com base em bibliotecas espectrais e critérios de correspondência de massa."
+            )
+    with fc2:
+        with st.container(border=True):
+            st.markdown("**🖥️ Este sistema**")
+            st.caption(
+                "Organiza os candidatos por pontuação de identificação e enriquece "
+                "com informações de bases de dados científicas (PubChem, ChEBI)."
+            )
+    with fc3:
+        with st.container(border=True):
+            st.markdown("**🧪 Especialista analítico**")
+            st.caption(
+                "Valida o Rank 1 considerando o contexto químico da amostra. "
+                "O sistema apoia a decisão — não a substitui."
+            )
+    st.caption(
+        "Cada **composto detectado** pode ter dezenas de **candidatos moleculares**. "
+        "O **Rank 1** é o mais compatível com o sinal medido — "
+        "a identificação definitiva requer avaliação do especialista."
+    )
 
 # ---------------------------------------------------------------------------
 # Visão geral — tabela principal
@@ -232,7 +284,7 @@ st.divider()
 COLUNAS_RESUMO = ["Sinal", "m/z Medido", "Candidato", score_col, "Score Qualidade Dados", "Rank"]
 COLUNAS_RESUMO = [c for c in COLUNAS_RESUMO if c in df_completo.columns]
 
-st.subheader("Visão Geral")
+st.subheader("Todos os candidatos do experimento")
 
 df_exibir = (
     df_completo[COLUNAS_RESUMO].copy()
@@ -245,48 +297,73 @@ st.dataframe(
     use_container_width=True,
     hide_index=True,
     column_config={
+        "Sinal": st.column_config.TextColumn(
+            "Composto detectado",
+            help="Código do sinal analítico atribuído pelo instrumento. Formato: tempo_de_retenção_m/z. Use o filtro lateral para explorar um composto específico.",
+        ),
+        "m/z Medido": st.column_config.NumberColumn(
+            "m/z medido",
+            help="Razão massa/carga registrada pelo instrumento para este sinal. Valor instrumental — não é a massa molecular diretamente.",
+            format="%.4f",
+        ),
+        "Candidato": st.column_config.TextColumn(
+            "Candidato molecular",
+            help="Nome do composto sugerido como possível identidade deste sinal. Pode haver múltiplos candidatos por composto detectado.",
+        ),
         score_col: st.column_config.ProgressColumn(
-            score_col,
-            help="Score de ranking (0–100) — média ponderada: Fragmentação 40% | Lab 30% | Isotopo 20% | Massa ppm 10%",
+            "Pontuação de identificação",
+            help="Score calculado pelo instrumento (0–100). Integra fragmentação MS/MS, padrão isotópico e erro de massa. Quanto maior, mais compatível com o sinal medido.",
             min_value=0,
             max_value=100,
             format="%.1f",
         ),
         "Score Qualidade Dados": st.column_config.ProgressColumn(
-            "Completude de Dados",
-            help="% dos metadados externos preenchidos (PubChem / ChEBI) — não entra no ranking",
+            "Dados externos disponíveis",
+            help="% de informações encontradas em bases científicas públicas (PubChem, ChEBI). Indica quão bem documentado é o candidato — não afeta o ranking.",
             min_value=0,
             max_value=100,
             format="%.0f%%",
         ),
-        "Rank": st.column_config.NumberColumn("Rank", help="1 = candidato mais plausível"),
+        "Rank": st.column_config.NumberColumn(
+            "Rank",
+            help="Posição entre os candidatos deste composto. Rank 1 = candidato mais provável segundo o instrumento.",
+        ),
     },
 )
 
 # ---------------------------------------------------------------------------
-# Detalhamento — aparece somente quando um sinal é selecionado
-# Filtra de df_completo (já carregado) — funciona para batch atual e histórico
+# Detalhamento — aparece somente quando um composto é selecionado
 # ---------------------------------------------------------------------------
 if sinal_escolhido != opcao_todos:
     st.divider()
-    st.subheader(f"Candidatos para o sinal `{sinal_escolhido}`")
+    st.subheader(f"Composto: `{sinal_escolhido}`")
+    st.caption(
+        "Candidatos moleculares sugeridos pelo instrumento, do mais ao menos provável. "
+        "Rank 1 = maior pontuação de identificação para este composto."
+    )
 
     df_detalhe = df_completo[df_completo["Sinal"] == sinal_escolhido].copy()
 
     if df_detalhe.empty:
-        st.warning("Nenhum candidato encontrado para este sinal.")
+        st.warning("Nenhum candidato encontrado para este composto.")
     else:
         melhor = df_detalhe[df_detalhe["Rank"] == 1]
         if not melhor.empty:
             nome_melhor  = melhor.iloc[0]["Candidato"]
             score_melhor = melhor.iloc[0].get(score_col, melhor.iloc[0].get("Score Total", 0))
             st.success(
-                f"**Candidato mais plausível (Rank 1):** {nome_melhor} "
-                f"— {score_col}: {score_melhor:.1f}/100"
+                f"**Candidato mais provável (Rank 1):** {nome_melhor}  \n"
+                f"Pontuação de identificação: **{score_melhor:.1f} / 100**  \n"
+                "Este é o composto considerado mais compatível com o sinal pelo instrumento. "
+                "Recomenda-se confirmação por especialista antes de reportar."
             )
 
-        # --- Dados laboratoriais (do equipamento) ---
-        st.markdown("**Dados laboratoriais** *(scores gerados pelo instrumento)*")
+        # --- Detalhes da identificação instrumental ---
+        st.markdown("**Detalhes da identificação instrumental**")
+        st.caption(
+            "Valores gerados pelo instrumento para cada candidato. "
+            "Úteis para investigar por que um candidato foi melhor ou pior posicionado."
+        )
         colunas_lab = [
             "Candidato", "Adducts", "Neutral Mass (Da)",
             "Score Lab", "Score Fragmentacao", "Mass Error (ppm)", "Isotope Similarity",
@@ -298,22 +375,48 @@ if sinal_escolhido != opcao_todos:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Score Lab":          st.column_config.ProgressColumn("Score Lab",          min_value=0, max_value=100, format="%.1f"),
-                "Score Fragmentacao": st.column_config.ProgressColumn("Score Fragmentacao", min_value=0, max_value=100, format="%.1f"),
-                "Mass Error (ppm)":   st.column_config.NumberColumn("Mass Error (ppm)",     format="%.4f"),
-                "Isotope Similarity": st.column_config.ProgressColumn("Isotope Similarity", min_value=0, max_value=100, format="%.1f"),
-                "Neutral Mass (Da)":  st.column_config.NumberColumn("Neutral Mass (Da)",    format="%.4f"),
-                "Rank":               st.column_config.NumberColumn("Rank"),
+                "Candidato": st.column_config.TextColumn("Candidato molecular"),
+                "Adducts": st.column_config.TextColumn(
+                    "Forma iônica detectada",
+                    help="Como a molécula foi ionizada durante a análise. Ex.: 'M-H' = perda de um próton; 'M+Na' = adição de sódio. Afeta o cálculo da massa molecular.",
+                ),
+                "Neutral Mass (Da)": st.column_config.NumberColumn(
+                    "Massa molecular calc. (Da)",
+                    help="Massa molecular calculada a partir do sinal medido, descontando o efeito da ionização. Em Daltons (Da).",
+                    format="%.4f",
+                ),
+                "Score Lab": st.column_config.ProgressColumn(
+                    "Score do instrumento",
+                    help="Pontuação geral calculada pelo software do equipamento LC-MS/MS, integrando todos os critérios de identificação.",
+                    min_value=0, max_value=100, format="%.1f",
+                ),
+                "Score Fragmentacao": st.column_config.ProgressColumn(
+                    "Correspondência MS/MS",
+                    help="Grau de coincidência entre os fragmentos detectados e o padrão esperado para este composto. Componente do score do instrumento.",
+                    min_value=0, max_value=100, format="%.1f",
+                ),
+                "Mass Error (ppm)": st.column_config.NumberColumn(
+                    "Erro de massa (ppm)",
+                    help="Diferença entre a massa medida e a massa teórica, em partes por milhão (ppm). Valores próximos de zero indicam melhor correspondência de massa.",
+                    format="%.4f",
+                ),
+                "Isotope Similarity": st.column_config.ProgressColumn(
+                    "Padrão isotópico",
+                    help="Semelhança entre o padrão de isótopos medido e o esperado para a fórmula molecular do candidato. Componente do score do instrumento.",
+                    min_value=0, max_value=100, format="%.1f",
+                ),
+                "Rank": st.column_config.NumberColumn(
+                    "Rank",
+                    help="Posição do candidato. Rank 1 = mais provável para este composto.",
+                ),
             },
         )
 
-        # --- Score Ranking (pipeline) ---
-        st.markdown(
-            "**Score Ranking** *(média ponderada — pesos provisórios, calibráveis pelo IST)*"
-        )
+        # --- Pontuação de identificação (ranking) ---
+        st.markdown("**Pontuação de identificação**")
         st.caption(
-            "Fragmentação 40% · Score Lab 30% · Similaridade Isotópica 20% · "
-            "Erro de Massa ppm 10% · Componentes nulos excluídos e pesos renormalizados"
+            "Score final que determina o ranking dos candidatos. "
+            "Calculado a partir dos dados instrumentais — pesos provisórios, calibráveis pelo IST."
         )
 
         colunas_score = ["Candidato", "Score Massa", score_col, "Score Qualidade Dados", "Rank"]
@@ -323,22 +426,26 @@ if sinal_escolhido != opcao_todos:
             use_container_width=True,
             hide_index=True,
             column_config={
+                "Candidato": st.column_config.TextColumn("Candidato molecular"),
                 score_col: st.column_config.ProgressColumn(
-                    score_col,
-                    help="Score de ranking (0–100)",
+                    "Pontuação de identificação",
+                    help="Score final (0–100) que determina o ranking dos candidatos deste composto.",
                     min_value=0, max_value=100, format="%.1f",
                 ),
                 "Score Qualidade Dados": st.column_config.ProgressColumn(
-                    "Score Qualidade Dados",
-                    help="Completude dos metadados externos — não entra no ranking",
+                    "Dados externos disponíveis",
+                    help="% de metadados encontrados em bases públicas (PubChem, ChEBI). Não entra no ranking.",
                     min_value=0, max_value=100, format="%.0f%%",
                 ),
                 "Score Massa": st.column_config.NumberColumn(
-                    "Score Massa",
-                    help="Pontuação do erro de massa (0–40 pontos): máximo quando erro ≤ 5 ppm, zero quando ≥ 20 ppm. Contribui 10% no Score Ranking.",
+                    "Pontuação de massa",
+                    help="Pontuação do erro de massa (0–40): máximo quando erro ≤ 5 ppm, zero quando ≥ 20 ppm.",
                     format="%.2f",
                 ),
-                "Rank": st.column_config.NumberColumn("Rank"),
+                "Rank": st.column_config.NumberColumn(
+                    "Rank",
+                    help="Rank 1 = candidato mais provável para este composto.",
+                ),
             },
         )
 
@@ -349,18 +456,18 @@ if sinal_escolhido != opcao_todos:
                 if c in df_detalhe.columns
             ]
             if cols_grafico:
-                st.markdown("**Comparativo visual — scores do instrumento** *(componentes primários do ranking)*")
+                st.markdown("**Comparativo dos scores instrumentais entre candidatos**")
+                st.caption("Componentes individuais da identificação — úteis para comparar candidatos com pontuação similar.")
                 try:
                     st.bar_chart(
                         df_detalhe.set_index("Candidato")[cols_grafico],
                         use_container_width=True,
                     )
                 except Exception:
-                    pass  # gráfico não crítico — omite sem quebrar a página
+                    pass
 
 # ---------------------------------------------------------------------------
 # Rodapé
 # ---------------------------------------------------------------------------
 st.divider()
-view = "vw_ranking_historico" if batch_info else "vw_ranking_candidatos"
-st.caption(f"Fonte: `{view}` | Banco: `banco_ist.db` | Pipeline: Omics ETL")
+st.caption("Omics ETL Pipeline · IST Ambiental / SENAI")
