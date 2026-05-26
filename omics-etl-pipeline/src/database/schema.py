@@ -116,7 +116,12 @@ CREATE TABLE IF NOT EXISTS candidato_sinal (
     -- Aliases de backward compatibility (= score_ranking e score_data_quality)
     score_total        REAL DEFAULT 0,
     score_metadata     REAL DEFAULT 0,
+    -- Ranking hierárquico IST (substituem score_ranking como critério de ordenação)
     rank_posicao       INTEGER,
+    rank_group         INTEGER,
+    is_tied            INTEGER DEFAULT 0,
+    criterio_desempate TEXT,
+    ranking_metodo     TEXT,
     data_calculo       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(sinal_id, molecula_id)
 );
@@ -172,7 +177,11 @@ SELECT
     c.score_ranking        AS "Score Ranking",
     c.score_data_quality   AS "Score Qualidade Dados",
     c.score_ranking        AS "Score Total",
-    c.rank_posicao         AS "Rank"
+    c.rank_posicao         AS "Rank",
+    c.rank_group           AS "Rank Group",
+    c.is_tied              AS "Empate",
+    c.criterio_desempate   AS "Criterio Desempate",
+    c.ranking_metodo       AS "Metodo Ranking"
 FROM candidato_sinal c
 JOIN fact_sinal      s ON c.sinal_id    = s.id
 JOIN dim_molecula    m ON c.molecula_id = m.id
@@ -208,7 +217,11 @@ SELECT
     c.score_ranking        AS "Score Ranking",
     c.score_data_quality   AS "Score Qualidade Dados",
     c.score_ranking        AS "Score Total",
-    c.rank_posicao         AS "Rank"
+    c.rank_posicao         AS "Rank",
+    c.rank_group           AS "Rank Group",
+    c.is_tied              AS "Empate",
+    c.criterio_desempate   AS "Criterio Desempate",
+    c.ranking_metodo       AS "Metodo Ranking"
 FROM candidato_sinal c
 JOIN fact_sinal      s ON c.sinal_id    = s.id
 JOIN dim_molecula    m ON c.molecula_id = m.id
@@ -229,7 +242,7 @@ def criar_tabelas() -> None:
 
     Seguro para re-execução em qualquer estado do banco.
     """
-    from src.database.migrate import migrar_v1_para_v2, migrar_v2_para_v3
+    from src.database.migrate import migrar_v1_para_v2, migrar_v2_para_v3, migrar_v3_para_v4
 
     logger.info("Inicializando schema do banco de dados...")
     conn = sqlite3.connect(DB_PATH)
@@ -245,6 +258,7 @@ def criar_tabelas() -> None:
 
         migrar_v1_para_v2(conn)   # batch_id em fact_sinal / candidato_sinal
         migrar_v2_para_v3(conn)   # score_ranking / score_data_quality
+        migrar_v3_para_v4(conn)   # rank_group / is_tied / criterio_desempate / ranking_metodo
 
         # Tabelas restantes (idempotentes)
         cur.execute(SQL_FACT_SINAL)

@@ -52,9 +52,185 @@ _CAMPOS_DATA_QUALITY = (
     "formula", "pubchem_cid", "peso_molecular", "chebi_id", "classe_quimica"
 )
 
+# ---------------------------------------------------------------------------
+# Ranking hierárquico IST — critérios sequenciais de desempate
+#
+# Ordem de prioridade validada pelo IST:
+#   1. score_fragmentacao  — maior é melhor; 0/None = sem poder discriminativo
+#   2. score_lab           — maior é melhor; None = dado ausente
+#   3. score_isotopo       — maior é melhor; None = dado ausente
+#   4. mass_error_ppm      — menor valor absoluto é melhor; None = dado ausente
+#   5. formula             — desempate alfabético determinístico
+#   6. empate persistente  → decisão humana (is_tied=True)
+# ---------------------------------------------------------------------------
+_INF     = float('inf')
+_NEG_INF = float('-inf')
+
+_CRITERIO_NAMES = ('fragmentacao', 'score_lab', 'isotopo', 'massa', 'formula')
+
+
+def _frag_key(v) -> float:
+    """
+    Chave de ordenação para fragmentation score.
+    0 e None/NaN → _NEG_INF: sem poder discriminativo neste critério (vai para o fim).
+    Valores positivos → valor bruto (quanto maior, melhor).
+    """
+    if v is None:
+        return _NEG_INF
+    try:
+        f = float(v)
+        if pd.isna(f) or f <= 0:
+            return _NEG_INF
+        return f
+    except (TypeError, ValueError):
+        return _NEG_INF
+
+
+def _numeric_key_desc(v) -> float:
+    """Chave descendente genérica (maior = melhor). None/NaN → _NEG_INF (vai para o fim)."""
+    if v is None:
+        return _NEG_INF
+    try:
+        f = float(v)
+        return _NEG_INF if pd.isna(f) else f
+    except (TypeError, ValueError):
+        return _NEG_INF
+
+
+def _mass_key_asc(v) -> float:
+    """Chave para erro de massa: valor absoluto, ascendente (menor = melhor). None/NaN → +inf."""
+    if v is None:
+        return _INF
+    try:
+        f = float(v)
+        return _INF if pd.isna(f) else abs(f)
+    except (TypeError, ValueError):
+        return _INF
+
+
+def _formula_key_asc(v) -> str:
+    """Chave de fórmula: string alfabética para desempate determinístico final. None → último."""
+    if v is None:
+        return '￿'
+    s = str(v).strip()
+    return s if s else '￿'
+
+
+def _sort_key_raw(c: dict) -> tuple:
+    """
+    Chave canônica de um candidato para detecção de empate.
+    Dois candidatos com raw keys idênticas são verdadeiramente empatados.
+    Tupla: (frag_float, lab_float, iso_float, massa_float, formula_str).
+    """
+    return (
+        _frag_key(c.get('score_fragmentacao')),
+        _numeric_key_desc(c.get('score_lab')),
+        _numeric_key_desc(c.get('score_isotopo')),
+        _mass_key_asc(c.get('mass_error_ppm')),
+        _formula_key_asc(c.get('formula')),
+    )
+
+
+def _sort_key_sortable(c: dict) -> tuple:
+    """
+    Chave ordenável para sorted() ascendente.
+    Critérios descendentes (frag, lab, iso) são negados para que valores maiores
+    apareçam primeiro na ordenação ascendente.
+    Critérios ascendentes (massa, formula) mantêm seus valores originais.
+    """
+    raw = _sort_key_raw(c)
+    return (
+        -raw[0],  # fragmentacao: maior é melhor → nega para sort asc
+        -raw[1],  # score_lab:    maior é melhor → nega
+        -raw[2],  # isotopo:      maior é melhor → nega
+         raw[3],  # massa:        menor abs é melhor → mantém
+         raw[4],  # formula:      alfabético → mantém (string)
+    )
+
+
+def _find_distinguishing_criterion(key_better: tuple, key_worse: tuple) -> str:
+    """
+    Retorna o nome do primeiro critério onde duas raw keys diferem.
+    key_better = candidato de rank superior; key_worse = rank inferior.
+    """
+    for k_a, k_b, nome in zip(key_better, key_worse, _CRITERIO_NAMES):
+        if k_a != k_b:
+            return nome
+    return 'empate_humano'
+
+
+def _ranking_hierarquico_grupo(candidatos: list) -> list:
+    """
+    Aplica o ranking hierárquico IST a um grupo de candidatos do mesmo composto.
+
+    Modifica cada dict da lista in-place, adicionando:
+        rank_posicao      (int)  : rank denso 1-based; empatados compartilham o mesmo valor
+        rank_group        (int)  : mesmo que rank_posicao (campo explícito de grupo)
+        is_tied           (bool) : True quando múltiplos candidatos dividem rank_posicao
+        criterio_desempate (str) : critério que resolveu (ou não) o empate
+        ranking_metodo    (str)  : 'hierarquico_ist'
+
+    Semântica de criterio_desempate:
+        Rank 1  → critério que separa rank 1 do rank 2 (o que "ganhou")
+        Rank N  → critério que separa este grupo do grupo acima
+        Empate  → 'empate_humano' (todos os 5 critérios idênticos, decisão humana)
+        Único   → 'unico' (único candidato ou único grupo)
+    """
+    if not candidatos:
+        return candidatos
+
+    for c in candidatos:
+        c['_raw']  = _sort_key_raw(c)
+        c['_sort'] = _sort_key_sortable(c)
+
+    sorted_cands = sorted(candidatos, key=lambda c: c['_sort'])
+
+    # Agrupa candidatos com raw keys idênticas (empates verdadeiros)
+    groups: list = []
+    current: list = [sorted_cands[0]]
+    for cand in sorted_cands[1:]:
+        if cand['_raw'] == current[0]['_raw']:
+            current.append(cand)
+        else:
+            groups.append(current)
+            current = [cand]
+    groups.append(current)
+
+    dense_rank = 1
+    for g_idx, group in enumerate(groups):
+        is_tied = len(group) > 1
+
+        if is_tied:
+            criterio = 'empate_humano'
+        elif len(groups) == 1:
+            criterio = 'unico'
+        elif g_idx == 0:
+            criterio = _find_distinguishing_criterion(
+                group[0]['_raw'], groups[1][0]['_raw']
+            )
+        else:
+            criterio = _find_distinguishing_criterion(
+                groups[g_idx - 1][0]['_raw'], group[0]['_raw']
+            )
+
+        for c in group:
+            c['rank_posicao']       = dense_rank
+            c['rank_group']         = dense_rank
+            c['is_tied']            = is_tied
+            c['criterio_desempate'] = criterio
+            c['ranking_metodo']     = 'hierarquico_ist'
+
+        dense_rank += 1
+
+    for c in sorted_cands:
+        c.pop('_raw',  None)
+        c.pop('_sort', None)
+
+    return sorted_cands
+
 
 # ---------------------------------------------------------------------------
-# Funções de scoring
+# Funções de scoring (diagnóstico / legado)
 # ---------------------------------------------------------------------------
 
 def _to_01(value, max_val: float) -> "float | None":
@@ -281,26 +457,70 @@ def _inserir_candidato(
     )
 
 
-def _atualizar_ranking(cursor: sqlite3.Cursor, batch_id: int) -> None:
+def _atualizar_ranking_hierarquico(cursor: sqlite3.Cursor, batch_id: int) -> None:
     """
-    Calcula rank_posicao usando score_ranking para os candidatos do batch atual.
-    Rank 1 = maior score_ranking dentro do sinal.
+    Aplica o ranking hierárquico IST a todos os candidatos do batch e persiste
+    rank_posicao, rank_group, is_tied, criterio_desempate e ranking_metodo.
 
-    Scoped por batch_id: rankings de batches anteriores ficam intactos.
+    Busca os candidatos do DB (com formula via JOIN em dim_molecula), agrupa
+    por sinal, chama _ranking_hierarquico_grupo() e executa bulk UPDATE.
+
+    score_ranking é preservado inalterado como coluna diagnóstica/legada.
+    Scoped por batch_id — batches anteriores não são afetados.
     """
     cursor.execute(
         """
-        UPDATE candidato_sinal
-        SET rank_posicao = (
-            SELECT COUNT(*) + 1
-            FROM candidato_sinal cs2
-            WHERE cs2.sinal_id     = candidato_sinal.sinal_id
-              AND cs2.batch_id     = candidato_sinal.batch_id
-              AND cs2.score_ranking > candidato_sinal.score_ranking
-        )
-        WHERE batch_id = ?
+        SELECT
+            c.id,
+            c.sinal_id,
+            c.score_fragmentacao,
+            c.score_lab,
+            c.score_isotopo,
+            c.mass_error_ppm,
+            m.formula
+        FROM candidato_sinal c
+        JOIN dim_molecula m ON c.molecula_id = m.id
+        WHERE c.batch_id = ?
         """,
         (batch_id,),
+    )
+    cols = ('id', 'sinal_id', 'score_fragmentacao', 'score_lab',
+            'score_isotopo', 'mass_error_ppm', 'formula')
+    candidatos = [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    grupos: dict = {}
+    for c in candidatos:
+        grupos.setdefault(c['sinal_id'], []).append(c)
+
+    updates = []
+    for grupo in grupos.values():
+        for c in _ranking_hierarquico_grupo(grupo):
+            updates.append((
+                c['rank_posicao'],
+                c['rank_group'],
+                1 if c['is_tied'] else 0,
+                c['criterio_desempate'],
+                c['ranking_metodo'],
+                c['id'],
+            ))
+
+    if updates:
+        cursor.executemany(
+            """
+            UPDATE candidato_sinal SET
+                rank_posicao       = ?,
+                rank_group         = ?,
+                is_tied            = ?,
+                criterio_desempate = ?,
+                ranking_metodo     = ?
+            WHERE id = ?
+            """,
+            updates,
+        )
+
+    logger.info(
+        f"Ranking hierárquico IST: {len(grupos)} sinais, "
+        f"{len(updates)} candidatos atualizados (batch {batch_id})."
     )
 
 
@@ -369,7 +589,7 @@ def carregar_dados_no_banco(df: pd.DataFrame, batch_id: int) -> dict:
                 logger.warning(f"Linha {idx} ignorada por erro: {e}")
                 erros += 1
 
-        _atualizar_ranking(cursor, batch_id)
+        _atualizar_ranking_hierarquico(cursor, batch_id)
         conn.commit()
 
         logger.info(

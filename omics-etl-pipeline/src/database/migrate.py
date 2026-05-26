@@ -305,3 +305,71 @@ def migrar_v2_para_v3(conn: sqlite3.Connection) -> None:
         f"Migração v2→v3 concluída: {len(updates)} candidatos com "
         "score_ranking recalculado."
     )
+
+
+# ---------------------------------------------------------------------------
+# Migração v3 → v4
+# ---------------------------------------------------------------------------
+
+def _precisa_migrar_v4(conn: sqlite3.Connection) -> bool:
+    """Retorna True se candidato_sinal existe mas ainda não tem rank_group."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='candidato_sinal'"
+    )
+    if not cur.fetchone():
+        return False
+    cur.execute("PRAGMA table_info(candidato_sinal)")
+    return "rank_group" not in {row[1] for row in cur.fetchall()}
+
+
+def migrar_v3_para_v4(conn: sqlite3.Connection) -> None:
+    """
+    Migração v3 → v4: adiciona campos de ranking hierárquico IST em candidato_sinal
+    e retroaplica o ranking para todos os batches existentes.
+
+    Novas colunas:
+        rank_group         — mesmo valor que rank_posicao (grupo explícito de empate)
+        is_tied            — 0/1: True quando múltiplos candidatos dividem rank_posicao
+        criterio_desempate — critério que resolveu (ou não) o empate
+        ranking_metodo     — 'hierarquico_ist'
+
+    rank_posicao existente é reescrito com o novo algoritmo hierárquico.
+    score_ranking é preservado como campo diagnóstico/legado.
+
+    Idempotente: seguro re-executar.
+    """
+    if not _precisa_migrar_v4(conn):
+        return
+
+    from src.etl.load import _atualizar_ranking_hierarquico
+
+    logger.info("Migração v3→v4: adicionando campos de ranking hierárquico IST...")
+    cur = conn.cursor()
+
+    for col, defn in [
+        ("rank_group",         "INTEGER"),
+        ("is_tied",            "INTEGER DEFAULT 0"),
+        ("criterio_desempate", "TEXT"),
+        ("ranking_metodo",     "TEXT"),
+    ]:
+        try:
+            cur.execute(f"ALTER TABLE candidato_sinal ADD COLUMN {col} {defn}")
+        except sqlite3.OperationalError:
+            pass  # coluna já existe — re-execução segura
+
+    conn.commit()
+
+    cur.execute(
+        "SELECT DISTINCT batch_id FROM candidato_sinal WHERE batch_id IS NOT NULL"
+    )
+    batch_ids = [row[0] for row in cur.fetchall()]
+
+    for bid in batch_ids:
+        _atualizar_ranking_hierarquico(cur, bid)
+
+    conn.commit()
+    logger.info(
+        f"Migração v3→v4 concluída: {len(batch_ids)} batch(es) com "
+        "ranking hierárquico IST aplicado."
+    )
