@@ -12,7 +12,13 @@ import streamlit as st
 _ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from src.ui.utils import carregar_ranking, carregar_ranking_batch, db_existe, listar_batches
+from src.ui.utils import (
+    carregar_cobertura_externa,
+    carregar_ranking,
+    carregar_ranking_batch,
+    db_existe,
+    listar_batches,
+)
 
 st.set_page_config(
     page_title="Insights Analíticos | Omics ETL",
@@ -22,8 +28,7 @@ st.set_page_config(
 
 st.title("📊 Insights Analíticos")
 st.caption(
-    "Exploração visual dos resultados — indicadores de apoio à interpretação analítica "
-    "| IST Ambiental / SENAI"
+    "Indicadores de apoio à interpretação analítica | IST Ambiental / SENAI"
 )
 st.divider()
 
@@ -38,7 +43,7 @@ if not db_existe():
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Seletor de análise (sidebar) — mesmo padrão das outras páginas
+# Sidebar — seletor de análise
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=30)
 def _listar() -> list:
@@ -53,7 +58,6 @@ if not batches_sucesso:
     st.stop()
 
 st.sidebar.header("Análise")
-
 _ir_para   = st.session_state.pop("ir_para_batch", None)
 _MAIS_REC  = None
 opcoes_ids = [_MAIS_REC] + [b["id"] for b in batches_sucesso]
@@ -113,78 +117,147 @@ if "Rank" not in df.columns:
     st.error("Estrutura de dados incompatível. Recarregue a página.")
     st.stop()
 
+# Batch ID real (para queries adicionais — ChEBI, PubChem)
+batch_id_real = int(df["Batch ID"].iloc[0]) if "Batch ID" in df.columns else None
+
+# Detecção de colunas disponíveis (backward compat com dados legados)
+score_col     = "Score Ranking" if "Score Ranking" in df.columns else "Score Total"
+_tem_empate   = "Empate" in df.columns
+_tem_criterio = "Criterio Desempate" in df.columns
+_tem_classes  = "Classe Quimica" in df.columns
+
 # ---------------------------------------------------------------------------
-# Detecção da coluna de score (backward compat)
+# Banner da análise histórica selecionada
 # ---------------------------------------------------------------------------
-score_col = "Score Ranking" if "Score Ranking" in df.columns else "Score Total"
+batch_info = next((b for b in batches_sucesso if b["id"] == batch_sel), None) if batch_sel else None
+if batch_info:
+    d_raw = (batch_info.get("iniciado_em") or "")[:16].replace("T", " ")
+    st.info(f"**Análise #{batch_info['id']}** — {d_raw} | {batch_info['nome_ident']}")
 
 # ---------------------------------------------------------------------------
 # Preparação dos dados analíticos
 # ---------------------------------------------------------------------------
 
-# Rank 1 deduplicado por composto (um registro por sinal — resolve empates)
-rank1_df = (
-    df[df["Rank"] == 1]
-    .sort_values(score_col, ascending=False)
-    .drop_duplicates(subset=["Sinal"])
-    .copy()
-)
+# rank1_df: todos os candidatos Rank 1 (inclui múltiplos em caso de empate)
+rank1_df    = df[df["Rank"] == 1].copy()
+# rank1_unico: um registro por Sinal (critério e classe são iguais no grupo de empate)
+rank1_unico = rank1_df.drop_duplicates(subset=["Sinal"]).copy()
 
-# Contagem de candidatos por composto
+# Contagem de candidatos e score Rank 1 por composto
 compound_counts = df.groupby("Sinal").size().reset_index(name="n_candidatos")
-
-# Dados por composto: candidatos + score Rank 1 + melhor candidato
-rank1_slim = rank1_df[["Sinal", score_col, "Candidato"]].copy().rename(
-    columns={score_col: "pontuacao_rank1", "Candidato": "melhor_candidato"}
+rank1_scores = (
+    rank1_df.groupby("Sinal")[score_col]
+    .first()
+    .reset_index()
+    .rename(columns={score_col: "pontuacao_rank1"})
 )
-compound_data = compound_counts.merge(rank1_slim, on="Sinal", how="left")
-compound_data["pontuacao_rank1"] = pd.to_numeric(
-    compound_data["pontuacao_rank1"], errors="coerce"
+rank1_scores["pontuacao_rank1"] = pd.to_numeric(rank1_scores["pontuacao_rank1"], errors="coerce")
+rank1_cand = rank1_unico[["Sinal", "Candidato"]].rename(columns={"Candidato": "melhor_candidato"})
+
+compound_data = (
+    compound_counts
+    .merge(rank1_scores, on="Sinal", how="left")
+    .merge(rank1_cand,   on="Sinal", how="left")
 )
 compound_data["melhor_candidato_curto"] = compound_data["melhor_candidato"].apply(
     lambda s: (s[:50] + "…") if isinstance(s, str) and len(s) > 50 else s
 )
 
-# Métricas gerais
+# Métricas base
 n_compostos      = len(compound_data)
 n_candidatos_tot = len(df)
-mean_pontuacao   = float(rank1_df[score_col].mean()) if not rank1_df.empty else 0.0
-mean_qualidade   = float(df["Score Qualidade Dados"].mean()) if "Score Qualidade Dados" in df.columns else 0.0
+mean_pontuacao   = float(rank1_unico[score_col].mean()) if not rank1_unico.empty else 0.0
 mean_cand_comp   = n_candidatos_tot / n_compostos if n_compostos else 0.0
-n_alta_conf      = int((rank1_df[score_col] > 80).sum()) if not rank1_df.empty else 0
 
-# Classes químicas dos Rank 1 (limpas)
-_tem_classes = "Classe Quimica" in rank1_df.columns
+# Empates
+if _tem_empate and not rank1_unico.empty:
+    _emp_num  = pd.to_numeric(rank1_unico["Empate"], errors="coerce").fillna(0)
+    n_empates = int((_emp_num > 0).sum())
+    pct_empates = n_empates / n_compostos * 100 if n_compostos else 0.0
+else:
+    n_empates   = 0
+    pct_empates = 0.0
+
+# Critérios de desempate — hierarquia biológica IST
+_CRITERIO_ORDER = ["fragmentacao", "score_lab", "isotopo", "massa", "formula", "unico", "empate_humano"]
+_CRITERIO_LABEL = {
+    "fragmentacao":  "Fragmentação MS/MS",
+    "score_lab":     "Score Lab",
+    "isotopo":       "Padrão Isotópico",
+    "massa":         "Erro de Massa",
+    "formula":       "Fórmula",
+    "unico":         "Candidato único",
+    "empate_humano": "Empate — decisão humana",
+}
+_CRITERIO_COLOR = {
+    "fragmentacao":  "#2e75b6",
+    "score_lab":     "#4472c4",
+    "isotopo":       "#5a9e6f",
+    "massa":         "#70ad47",
+    "formula":       "#a8c9a5",
+    "unico":         "#9e9e9e",
+    "empate_humano": "#e57373",
+}
+
+if _tem_criterio and not rank1_unico.empty:
+    _crit_raw = (
+        rank1_unico["Criterio Desempate"]
+        .fillna("desconhecido")
+        .value_counts()
+        .reset_index()
+    )
+    _crit_raw.columns = ["criterio", "n"]
+    _crit_raw["label"] = _crit_raw["criterio"].map(_CRITERIO_LABEL).fillna(_crit_raw["criterio"])
+    _crit_raw["cor"]   = _crit_raw["criterio"].map(_CRITERIO_COLOR).fillna("#cccccc")
+    _crit_raw["ordem"] = _crit_raw["criterio"].map({c: i for i, c in enumerate(_CRITERIO_ORDER)}).fillna(99)
+    criterio_counts    = _crit_raw.sort_values("ordem").reset_index(drop=True)
+
+    _crit_bio = (
+        criterio_counts[~criterio_counts["criterio"].isin(["unico", "empate_humano"])]
+        .sort_values("n", ascending=False)
+    )
+    criterio_dom   = _crit_bio.iloc[0]["criterio"] if not _crit_bio.empty else None
+    criterio_dom_n = int(_crit_bio.iloc[0]["n"]) if not _crit_bio.empty else 0
+    n_nao_resolvidos = int(
+        criterio_counts.loc[criterio_counts["criterio"] == "empate_humano", "n"].sum()
+    )
+    n_resolvidos = n_compostos - n_nao_resolvidos
+else:
+    criterio_counts  = pd.DataFrame()
+    criterio_dom     = None
+    criterio_dom_n   = 0
+    n_resolvidos     = 0
+    n_nao_resolvidos = n_empates
+
+# Classes químicas dos Rank 1
 if _tem_classes:
-    classes_raw    = rank1_df["Classe Quimica"].fillna("Não classificada")
-    classes_raw    = classes_raw.replace("Nao classificada", "Não classificada")
-    classes_cnt    = classes_raw.value_counts().reset_index()
+    _cl_raw = (
+        rank1_unico["Classe Quimica"]
+        .fillna("Não classificada")
+        .replace("Nao classificada", "Não classificada")
+    )
+    classes_cnt = _cl_raw.value_counts().reset_index()
     classes_cnt.columns = ["Classe química", "Frequência"]
     classes_classif = classes_cnt[classes_cnt["Classe química"] != "Não classificada"]
-    n_nc           = int(classes_cnt.loc[classes_cnt["Classe química"] == "Não classificada", "Frequência"].sum())
-    n_classif      = int(classes_classif["Frequência"].sum())
+    n_nc      = int(classes_cnt.loc[classes_cnt["Classe química"] == "Não classificada", "Frequência"].sum())
+    n_classif = int(classes_classif["Frequência"].sum())
 else:
-    classes_cnt     = pd.DataFrame()
-    classes_classif = pd.DataFrame()
-    n_nc            = 0
-    n_classif       = 0
+    classes_cnt = classes_classif = pd.DataFrame()
+    n_nc = n_classif = 0
 
 pct_classif = n_classif / n_compostos * 100 if n_compostos else 0.0
 
-# ---------------------------------------------------------------------------
-# Identificação da análise exibida
-# ---------------------------------------------------------------------------
-batch_info = next((b for b in batches_sucesso if b["id"] == batch_sel), None) if batch_sel else None
-if batch_info:
-    d_raw = (batch_info.get("iniciado_em") or "")[:16].replace("T", " ")
-    st.info(
-        f"**Análise #{batch_info['id']}** — {d_raw} | {batch_info['nome_ident']}"
-    )
+# Cobertura de bases externas (ChEBI / PubChem)
+cobertura_ext: dict = {}
+if batch_id_real is not None:
+    cobertura_ext = carregar_cobertura_externa(batch_id_real)
 
-# ---------------------------------------------------------------------------
-# Métricas principais
-# ---------------------------------------------------------------------------
-m1, m2, m3, m4, m5, m6 = st.columns(6)
+# ===========================================================================
+# BLOCO 1 — Resumo da análise
+# ===========================================================================
+st.subheader("Resumo da análise")
+
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric(
     "Compostos detectados",
     n_compostos,
@@ -193,56 +266,54 @@ m1.metric(
 m2.metric(
     "Total de candidatos",
     n_candidatos_tot,
-    help="Soma de todos os candidatos moleculares para todos os compostos detectados",
+    help="Soma de todos os candidatos moleculares sugeridos para todos os compostos",
 )
 m3.metric(
-    "Confiança média (Rank 1)",
+    "Score médio (Rank 1)",
     f"{mean_pontuacao:.1f}",
-    help="Pontuação média de identificação dos candidatos mais prováveis de cada composto (0–100)",
+    help="Score médio de identificação dos candidatos mais prováveis — escala 0 a 100",
 )
 m4.metric(
+    "Compostos em empate",
+    f"{n_empates} ({pct_empates:.0f}%)" if _tem_empate else "—",
+    help=(
+        "Compostos com dois ou mais candidatos indistinguíveis automaticamente no Rank 1. "
+        "Requerem decisão do especialista."
+    ),
+)
+m5.metric(
     "Candidatos por composto",
     f"{mean_cand_comp:.1f}",
     help="Média de candidatos moleculares por composto — valores altos indicam maior ambiguidade",
 )
-m5.metric(
-    "Alta confiança (> 80)",
-    f"{n_alta_conf} / {n_compostos}",
-    help="Compostos cujo candidato mais provável (Rank 1) possui pontuação acima de 80",
-)
-m6.metric(
-    "Dados externos disponíveis",
-    f"{mean_qualidade:.0f}%",
-    help="Percentual médio de informações encontradas em bases públicas (PubChem, ChEBI)",
-)
 
 st.divider()
 
-# ---------------------------------------------------------------------------
-# Leitura rápida do experimento
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# BLOCO 5 — Leitura rápida / Insights automáticos
+# ===========================================================================
 st.subheader("Leitura rápida do experimento")
 
 _insights: list[tuple[str, str]] = []
 
-# 1 — Confiança geral
+# Confiança geral
 if mean_pontuacao >= 75:
     _insights.append(("success",
-        f"**Alta confiança geral:** pontuação média dos candidatos mais prováveis é "
-        f"**{mean_pontuacao:.1f}/100** — identificações com boa correspondência espectral."
+        f"**Alta confiança geral:** score médio dos Rank 1 é **{mean_pontuacao:.1f}/100** — "
+        "boa correspondência espectral na maioria das identificações."
     ))
-elif mean_pontuacao >= 50:
+elif mean_pontuacao >= 45:
     _insights.append(("info",
-        f"**Confiança moderada:** pontuação média dos candidatos mais prováveis é "
-        f"**{mean_pontuacao:.1f}/100** — recomenda-se avaliação individual dos compostos com scores mais baixos."
+        f"**Confiança moderada:** score médio de **{mean_pontuacao:.1f}/100** — "
+        "recomenda-se avaliação individual dos compostos com scores mais baixos."
     ))
 else:
     _insights.append(("warning",
-        f"**Baixa confiança geral:** pontuação média de **{mean_pontuacao:.1f}/100** — "
+        f"**Baixa confiança geral:** score médio de **{mean_pontuacao:.1f}/100** — "
         "o experimento apresenta alta ambiguidade e requer revisão detalhada pelo especialista."
     ))
 
-# 2 — Ambiguidade
+# Ambiguidade
 if mean_cand_comp >= 15:
     _insights.append(("warning",
         f"**Alta ambiguidade molecular:** média de **{mean_cand_comp:.1f} candidatos por composto** — "
@@ -258,251 +329,341 @@ else:
         f"**Ambiguidade moderada:** média de **{mean_cand_comp:.1f} candidatos por composto**."
     ))
 
-# 3 — Cobertura de alta confiança
-pct_alta = n_alta_conf / n_compostos * 100 if n_compostos else 0.0
-if pct_alta >= 50:
-    _insights.append(("success",
-        f"**{n_alta_conf} de {n_compostos} compostos ({pct_alta:.0f}%)** possuem Rank 1 "
-        "com pontuação acima de 80 — boa cobertura de identificações confiáveis."
-    ))
-elif n_alta_conf > 0:
+# Empates
+if _tem_empate:
+    if pct_empates >= 50:
+        _insights.append(("warning",
+            f"**Este experimento apresenta alta ambiguidade residual:** "
+            f"**{n_empates} de {n_compostos} compostos ({pct_empates:.0f}%)** com Rank 1 em empate — "
+            "nenhum critério automático foi suficiente para distingui-los; requerem decisão do especialista."
+        ))
+    elif pct_empates >= 15:
+        _insights.append(("info",
+            f"**{n_empates} compostos ({pct_empates:.0f}%) em empate no Rank 1** — "
+            "a maioria das identificações foi resolvida automaticamente."
+        ))
+    elif n_empates > 0:
+        _insights.append(("info",
+            f"**{n_empates} composto(s) em empate ({pct_empates:.0f}%)** — baixa taxa de ambiguidade residual."
+        ))
+    else:
+        _insights.append(("success",
+            "**Todos os Rank 1 foram resolvidos automaticamente** — nenhum empate detectado neste experimento."
+        ))
+
+# Critério dominante
+if criterio_dom and criterio_dom_n > 0:
     _insights.append(("info",
-        f"**{n_alta_conf} de {n_compostos} compostos ({pct_alta:.0f}%)** possuem Rank 1 "
-        "com pontuação acima de 80."
-    ))
-else:
-    _insights.append(("warning",
-        f"**Nenhum composto** possui Rank 1 com pontuação acima de 80 — "
-        "todas as identificações requerem validação manual."
+        f"**A maioria das identificações foi resolvida por "
+        f"{_CRITERIO_LABEL.get(criterio_dom, criterio_dom).lower()}:** "
+        f"{criterio_dom_n} de {n_compostos} compostos tiveram o Rank 1 determinado por este critério."
     ))
 
-# 4 — Classificação química
-if n_compostos > 0:
+# Cobertura química
+if n_compostos > 0 and _tem_classes:
     if pct_classif >= 60:
         _insights.append(("success",
-            f"**{pct_classif:.0f}% dos candidatos mais prováveis** foram classificados "
-            "quimicamente em bases públicas (PubChem / ChEBI)."
+            f"**{pct_classif:.0f}% dos Rank 1** foram classificados quimicamente em bases públicas (PubChem / ChEBI)."
         ))
     elif pct_classif >= 25:
         _insights.append(("info",
-            f"**{pct_classif:.0f}% dos candidatos mais prováveis** possuem classificação "
-            "química em bases públicas."
+            f"**{pct_classif:.0f}% dos Rank 1** possuem classificação química documentada."
         ))
     else:
         _insights.append(("info",
-            "**A maioria dos candidatos mais prováveis não possui classificação química documentada** "
-            "— frequente em compostos emergentes, de síntese ou pouco estudados. "
-            "Não indica problema na identificação."
+            "**A maioria dos Rank 1 não possui classificação química** — "
+            "frequente em compostos emergentes ou de síntese não catalogados nas bases públicas."
         ))
 
+# Classe predominante
+if not classes_classif.empty:
+    _classe_dom   = classes_classif.iloc[0]["Classe química"]
+    _freq_dom_abs = int(classes_classif.iloc[0]["Frequência"])
+    _pct_dom      = _freq_dom_abs / n_compostos * 100 if n_compostos else 0
+    _insights.append(("info",
+        f"**Há predominância de {_classe_dom.lower()}** — "
+        f"{_freq_dom_abs} de {n_compostos} compostos ({_pct_dom:.0f}%) são desta classe química."
+    ))
+
 with st.container(border=True):
-    for tipo, texto in _insights:
-        if tipo == "success":
-            st.success(texto)
-        elif tipo == "warning":
-            st.warning(texto)
-        else:
-            st.info(texto)
+    for _tipo, _texto in _insights:
+        getattr(st, _tipo)(_texto)
 
 st.divider()
 
-# ---------------------------------------------------------------------------
-# Seção 1 — Distribuição das pontuações de identificação
-# ---------------------------------------------------------------------------
-st.subheader("Distribuição das pontuações de identificação")
+# ===========================================================================
+# BLOCO 2 — Ranking de sinais
+# ===========================================================================
+st.subheader("Ranking de sinais")
+st.caption("Compostos organizados por diferentes critérios analíticos. Use as abas para explorar.")
+
+tab_conf, tab_ambig, tab_cands, tab_empate = st.tabs([
+    "Mais confiáveis",
+    "Menos confiáveis",
+    "Mais candidatos",
+    "Em empate",
+])
+
+_TOP  = 15
+_base = compound_data.copy()
+_base["pontuacao_rank1"] = pd.to_numeric(_base["pontuacao_rank1"], errors="coerce")
+
+# Enriquece _base com critério de desempate (mapeado para label legível)
+if _tem_criterio:
+    _crit_sinal = rank1_unico[["Sinal", "Criterio Desempate"]].drop_duplicates("Sinal")
+    _base = _base.merge(_crit_sinal, on="Sinal", how="left")
+    _base["Criterio Desempate"] = _base["Criterio Desempate"].map(
+        lambda x: _CRITERIO_LABEL.get(str(x), str(x)) if pd.notna(x) else "—"
+    )
+
+_COLS_SRC_BASE = ["Sinal", "pontuacao_rank1", "n_candidatos", "melhor_candidato_curto"]
+_COLS_DST_BASE = ["Composto", "Score Rank 1", "N° candidatos", "Candidato mais provável"]
+if _tem_criterio and "Criterio Desempate" in _base.columns:
+    _COLS_SRC = _COLS_SRC_BASE + ["Criterio Desempate"]
+    _COLS_DST = _COLS_DST_BASE + ["Critério de desempate"]
+else:
+    _COLS_SRC, _COLS_DST = _COLS_SRC_BASE, _COLS_DST_BASE
+
+
+def _tabela(df_tab: pd.DataFrame, cols_src: list, cols_dst: list) -> pd.DataFrame:
+    avail_src = [c for c in cols_src if c in df_tab.columns]
+    avail_dst = [cols_dst[i] for i, c in enumerate(cols_src) if c in df_tab.columns]
+    out = df_tab[avail_src].copy()
+    out.columns = avail_dst
+    if "Score Rank 1" in out.columns:
+        out["Score Rank 1"] = pd.to_numeric(out["Score Rank 1"], errors="coerce").round(1)
+    return out.reset_index(drop=True)
+
+
+with tab_conf:
+    st.caption("Compostos com maior score no Rank 1 — identificações com melhor correspondência espectral.")
+    _top = _base.dropna(subset=["pontuacao_rank1"]).nlargest(_TOP, "pontuacao_rank1")
+    st.dataframe(_tabela(_top, _COLS_SRC, _COLS_DST), hide_index=True, use_container_width=True)
+
+with tab_ambig:
+    st.caption("Compostos com menor score no Rank 1 — maior incerteza na identificação; revisão prioritária.")
+    _bot = _base.dropna(subset=["pontuacao_rank1"]).nsmallest(_TOP, "pontuacao_rank1")
+    st.dataframe(_tabela(_bot, _COLS_SRC, _COLS_DST), hide_index=True, use_container_width=True)
+
+with tab_cands:
+    st.caption("Compostos com o maior número de hipóteses moleculares.")
+    _topc = _base.nlargest(_TOP, "n_candidatos")
+    _cols_c_src = ["Sinal", "n_candidatos", "pontuacao_rank1", "melhor_candidato_curto"]
+    _cols_c_dst = ["Composto", "N° candidatos", "Score Rank 1", "Candidato mais provável"]
+    if _tem_criterio and "Criterio Desempate" in _base.columns:
+        _cols_c_src.append("Criterio Desempate")
+        _cols_c_dst.append("Critério de desempate")
+    st.dataframe(_tabela(_topc, _cols_c_src, _cols_c_dst), hide_index=True, use_container_width=True)
+
+with tab_empate:
+    if _tem_empate:
+        _emp_mask   = pd.to_numeric(rank1_unico["Empate"], errors="coerce").fillna(0) > 0
+        _emp_sinais = rank1_unico[_emp_mask]["Sinal"].tolist()
+        if _emp_sinais:
+            st.caption(
+                f"**{len(_emp_sinais)} composto(s)** com dois ou mais candidatos "
+                "indistinguíveis automaticamente no Rank 1 — requerem decisão do especialista."
+            )
+            _emp_data = (
+                _base[_base["Sinal"].isin(_emp_sinais)]
+                [["Sinal", "n_candidatos", "pontuacao_rank1", "melhor_candidato_curto"]]
+                .sort_values("n_candidatos", ascending=False)
+            )
+            _emp_data.columns = ["Composto", "N° candidatos", "Score Rank 1", "Candidato mais provável"]
+            _emp_data["Score Rank 1"] = pd.to_numeric(_emp_data["Score Rank 1"], errors="coerce").round(1)
+            st.dataframe(_emp_data.reset_index(drop=True), hide_index=True, use_container_width=True)
+
+            # Detalhe dos candidatos empatados por composto
+            _score_emp_cols = [c for c in [
+                "Candidato", score_col, "Score Fragmentacao", "Score Lab", "Isotope Similarity"
+            ] if c in rank1_df.columns]
+            _rename_emp = {
+                score_col: "Score",
+                "Score Fragmentacao": "Fragmentação",
+                "Isotope Similarity": "Isótopo",
+            }
+            _n_exibir   = min(10, len(_emp_sinais))
+            _label_exp  = (
+                f"Candidatos em empate por composto ({_n_exibir} de {len(_emp_sinais)})"
+                if len(_emp_sinais) > 10
+                else f"Candidatos em empate por composto ({len(_emp_sinais)})"
+            )
+            with st.expander(_label_exp):
+                for _sinal in _emp_sinais[:10]:
+                    _g = rank1_df[rank1_df["Sinal"] == _sinal][_score_emp_cols].rename(columns=_rename_emp)
+                    st.markdown(f"**{_sinal}**")
+                    st.dataframe(_g, hide_index=True, use_container_width=True)
+        else:
+            st.success("Nenhum composto apresenta empate no Rank 1 neste experimento.")
+    else:
+        st.info("Informação de empate não disponível para esta análise (dados de experimento legado).")
+
+st.divider()
+
+# ===========================================================================
+# BLOCO 3 — Qualidade da identificação
+# ===========================================================================
+st.subheader("Qualidade da identificação")
+
+# --- Gráfico de discriminabilidade (distribuição de critérios de desempate) ---
+if _tem_criterio and not criterio_counts.empty:
+    st.caption(
+        "Distribuição dos critérios que determinaram o Rank 1 para cada composto. "
+        "Revela o poder de discriminação de cada nível do ranking hierárquico IST."
+    )
+
+    _col_crit, _col_crit_stats = st.columns([3, 1])
+
+    with _col_crit:
+        _bar_crit = (
+            alt.Chart(criterio_counts)
+            .mark_bar(opacity=0.88, cornerRadiusTopRight=2, cornerRadiusBottomRight=2)
+            .encode(
+                y=alt.Y("label:N", sort=None, title=None,
+                        axis=alt.Axis(labelLimit=200)),
+                x=alt.X("n:Q", title="Compostos com Rank 1 determinado por este critério"),
+                color=alt.Color("cor:N", scale=None, legend=None),
+                tooltip=[
+                    alt.Tooltip("label:N", title="Critério"),
+                    alt.Tooltip("n:Q", title="Compostos"),
+                ],
+            )
+            .properties(height=max(200, len(criterio_counts) * 44))
+        )
+        st.altair_chart(_bar_crit, use_container_width=True)
+
+    with _col_crit_stats:
+        _pct_auto = n_resolvidos / n_compostos * 100 if n_compostos else 0.0
+        st.metric(
+            "Resolvidos automaticamente",
+            f"{n_resolvidos} ({_pct_auto:.0f}%)",
+            help="Compostos com Rank 1 determinado por critério automático (inclui candidato único)",
+        )
+        st.metric(
+            "Requerem decisão humana",
+            n_nao_resolvidos,
+            help="Compostos em empate no Rank 1 — sem critério automático suficiente para desambiguar",
+        )
+
+    st.caption(
+        "**Fragmentação MS/MS** é o critério de maior poder biológico (prioridade 1 no ranking IST) — "
+        "sua predominância indica boa qualidade espectral do experimento. "
+        "**Empate — decisão humana** indica compostos que requerem avaliação manual pelo especialista."
+    )
+
+    st.markdown("---")
+
+# --- Distribuição de empates ---
+if _tem_empate:
+    st.markdown("**Distribuição de empates por número de candidatos**")
+    st.caption(
+        "Compostos em empate, agrupados pelo número de candidatos que dividem o Rank 1. "
+        "Grupos maiores indicam maior dificuldade de resolução."
+    )
+
+    # Para cada sinal em empate, contar quantos candidatos têm Rank=1
+    if n_empates > 0:
+        _emp_mask2  = pd.to_numeric(rank1_unico["Empate"], errors="coerce").fillna(0) > 0
+        _emp_sinais2 = rank1_unico[_emp_mask2]["Sinal"].tolist()
+        _emp_size   = (
+            rank1_df[rank1_df["Sinal"].isin(_emp_sinais2)]
+            .groupby("Sinal")
+            .size()
+            .reset_index(name="n_empatados")
+        )
+        _dist_emp = _emp_size["n_empatados"].value_counts().reset_index()
+        _dist_emp.columns = ["Candidatos empatados", "Compostos"]
+        _dist_emp = _dist_emp.sort_values("Candidatos empatados")
+        st.dataframe(_dist_emp, hide_index=True, use_container_width=True)
+    else:
+        st.success("Nenhum empate detectado — distribuição não aplicável.")
+
+    st.markdown("---")
+
+# --- Histograma de scores ---
+st.markdown("**Distribuição dos scores de identificação (Rank 1)**")
 st.caption(
-    "Pontuação de identificação do candidato mais provável (Rank 1) para cada composto detectado. "
-    "Mostra quão confiante o instrumento está nas identificações deste experimento."
+    "Score do candidato mais provável para cada composto. "
+    "A linha vermelha pontilhada marca 80 — limiar de alta confiança."
 )
 
-if not rank1_df.empty and rank1_df[score_col].notna().any():
-    scores_plot = rank1_df[[score_col, "Sinal"]].copy()
-    scores_plot = scores_plot.rename(columns={score_col: "Pontuação"})
-    scores_plot["Pontuação"] = pd.to_numeric(scores_plot["Pontuação"], errors="coerce")
-    scores_plot = scores_plot.dropna(subset=["Pontuação"])
+if not rank1_unico.empty and rank1_unico[score_col].notna().any():
+    _sp = (
+        rank1_unico[[score_col, "Sinal"]]
+        .rename(columns={score_col: "Pontuação"})
+        .copy()
+    )
+    _sp["Pontuação"] = pd.to_numeric(_sp["Pontuação"], errors="coerce")
+    _sp = _sp.dropna(subset=["Pontuação"])
 
-    hist = (
-        alt.Chart(scores_plot)
-        .mark_bar(color="#4472c4", opacity=0.85, cornerRadiusTopLeft=2, cornerRadiusTopRight=2)
-        .encode(
-            x=alt.X(
-                "Pontuação:Q",
-                bin=alt.Bin(step=10),
-                title="Pontuação de identificação (Rank 1)",
-                axis=alt.Axis(values=list(range(0, 110, 10))),
-                scale=alt.Scale(domain=[0, 100]),
-            ),
-            y=alt.Y("count():Q", title="Número de compostos"),
-            tooltip=[
-                alt.Tooltip("Pontuação:Q", bin=alt.Bin(step=10), title="Faixa de pontuação"),
-                alt.Tooltip("count():Q", title="Compostos nesta faixa"),
-            ],
+    if not _sp.empty:
+        _hist = (
+            alt.Chart(_sp)
+            .mark_bar(color="#4472c4", opacity=0.85,
+                      cornerRadiusTopLeft=2, cornerRadiusTopRight=2)
+            .encode(
+                x=alt.X(
+                    "Pontuação:Q",
+                    bin=alt.Bin(step=10),
+                    title="Score de identificação (Rank 1)",
+                    axis=alt.Axis(values=list(range(0, 110, 10))),
+                    scale=alt.Scale(domain=[0, 100]),
+                ),
+                y=alt.Y("count():Q", title="Compostos"),
+                tooltip=[
+                    alt.Tooltip("Pontuação:Q", bin=alt.Bin(step=10), title="Faixa de score"),
+                    alt.Tooltip("count():Q", title="Compostos"),
+                ],
+            )
+            .properties(height=220)
         )
-        .properties(height=280)
-    )
-
-    linha_80 = (
-        alt.Chart(pd.DataFrame({"v": [80.0]}))
-        .mark_rule(color="#c0392b", strokeDash=[6, 3], opacity=0.65, size=1.5)
-        .encode(x="v:Q")
-    )
-
-    st.altair_chart((hist + linha_80).properties(height=280), use_container_width=True)
-    st.caption(
-        "A linha vermelha pontilhada marca a pontuação 80 — limiar de alta confiança. "
-        "Distribuições deslocadas para a esquerda (< 50) indicam experimentos com alta ambiguidade geral; "
-        "concentrações acima de 70 indicam boa qualidade de identificação."
-    )
+        _linha_80 = (
+            alt.Chart(pd.DataFrame({"v": [80.0]}))
+            .mark_rule(color="#c0392b", strokeDash=[6, 3], opacity=0.65, size=1.5)
+            .encode(x="v:Q")
+        )
+        st.altair_chart((_hist + _linha_80).properties(height=220), use_container_width=True)
+        st.caption(
+            "Distribuições deslocadas para a esquerda (< 50) indicam experimentos com alta ambiguidade geral; "
+            "concentrações acima de 70 indicam boa qualidade de identificação."
+        )
 else:
-    st.info("Dados insuficientes para o histograma.")
+    st.info("Dados insuficientes para o histograma de scores.")
 
 st.divider()
 
-# ---------------------------------------------------------------------------
-# Seção 2 — Ambiguidade molecular
-# ---------------------------------------------------------------------------
-st.subheader("Ambiguidade molecular")
-
-col_desc, _ = st.columns([3, 1])
-with col_desc:
-    st.caption(
-        "Cada ponto representa um composto detectado. "
-        "O eixo horizontal mostra quantos candidatos foram sugeridos; "
-        "o eixo vertical mostra a pontuação do candidato mais provável (Rank 1). "
-        "Passe o cursor sobre um ponto para ver os detalhes."
-    )
-
-if len(compound_data) >= 2:
-    scatter_df = compound_data.dropna(subset=["pontuacao_rank1"]).copy()
-    scatter_df["pontuacao_rank1"] = scatter_df["pontuacao_rank1"].round(1)
-
-    # Linhas de referência dos quadrantes
-    h_rule = (
-        alt.Chart(pd.DataFrame({"y": [70.0]}))
-        .mark_rule(color="#888888", strokeDash=[4, 4], opacity=0.35, size=1)
-        .encode(y="y:Q")
-    )
-    v_rule = (
-        alt.Chart(pd.DataFrame({"x": [float(compound_data["n_candidatos"].quantile(0.75))]}))
-        .mark_rule(color="#888888", strokeDash=[4, 4], opacity=0.35, size=1)
-        .encode(x="x:Q")
-    )
-
-    scatter = (
-        alt.Chart(scatter_df)
-        .mark_circle(opacity=0.80)
-        .encode(
-            x=alt.X(
-                "n_candidatos:Q",
-                title="Número de candidatos moleculares",
-                scale=alt.Scale(zero=True),
-            ),
-            y=alt.Y(
-                "pontuacao_rank1:Q",
-                title="Pontuação de identificação (Rank 1)",
-                scale=alt.Scale(domain=[0, 105]),
-            ),
-            size=alt.Size(
-                "n_candidatos:Q",
-                scale=alt.Scale(range=[60, 300]),
-                legend=None,
-            ),
-            color=alt.Color(
-                "pontuacao_rank1:Q",
-                scale=alt.Scale(scheme="blues", domain=[0, 100]),
-                legend=alt.Legend(title="Pontuação Rank 1", orient="right"),
-            ),
-            tooltip=[
-                alt.Tooltip("Sinal:N", title="Composto"),
-                alt.Tooltip("n_candidatos:Q", title="Candidatos"),
-                alt.Tooltip("pontuacao_rank1:Q", title="Pontuação Rank 1", format=".1f"),
-                alt.Tooltip("melhor_candidato_curto:N", title="Melhor candidato"),
-            ],
-        )
-        .properties(height=360)
-    )
-
-    st.altair_chart((scatter + h_rule + v_rule).properties(height=360), use_container_width=True)
-
-    col_q1, col_q2 = st.columns(2)
-    with col_q1:
-        with st.container(border=True):
-            st.markdown("**Superior esquerdo — identificação clara**")
-            st.caption("Poucos candidatos e alta pontuação. O instrumento encontrou poucos compostos compatíveis e o melhor deles tem boa correspondência espectral.")
-    with col_q2:
-        with st.container(border=True):
-            st.markdown("**Inferior direito — alta ambiguidade**")
-            st.caption("Muitos candidatos e baixa pontuação. Diversas moléculas são compatíveis com o sinal e nenhuma se destaca — requer revisão prioritária pelo especialista.")
-
-    st.divider()
-
-    # Bar: compostos com mais candidatos
-    top_n      = min(15, len(compound_data))
-    top_comp   = compound_data.nlargest(top_n, "n_candidatos").copy()
-    top_comp   = top_comp.sort_values("n_candidatos", ascending=True)
-
-    st.markdown(f"**Compostos com maior número de candidatos** (top {top_n})")
-    st.caption("Compostos com muitos candidatos e baixa pontuação representam os casos de maior ambiguidade e são prioritários na revisão manual.")
-
-    bar_cands = (
-        alt.Chart(top_comp)
-        .mark_bar(color="#4472c4", opacity=0.82, cornerRadiusTopRight=2, cornerRadiusBottomRight=2)
-        .encode(
-            y=alt.Y("Sinal:N", sort=None, title="Composto detectado"),
-            x=alt.X("n_candidatos:Q", title="Número de candidatos moleculares"),
-            color=alt.Color(
-                "pontuacao_rank1:Q",
-                scale=alt.Scale(scheme="blues", domain=[0, 100]),
-                legend=alt.Legend(title="Pontuação Rank 1"),
-            ),
-            tooltip=[
-                alt.Tooltip("Sinal:N", title="Composto"),
-                alt.Tooltip("n_candidatos:Q", title="Candidatos"),
-                alt.Tooltip("pontuacao_rank1:Q", title="Pontuação Rank 1", format=".1f"),
-                alt.Tooltip("melhor_candidato_curto:N", title="Melhor candidato"),
-            ],
-        )
-        .properties(height=max(200, top_n * 32))
-    )
-
-    st.altair_chart(bar_cands, use_container_width=True)
-
-else:
-    st.info("São necessários ao menos dois compostos para exibir o gráfico de ambiguidade.")
-
-st.divider()
-
-# ---------------------------------------------------------------------------
-# Seção 3 — Perfil químico do experimento
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# BLOCO 4 — Perfil químico
+# ===========================================================================
 st.subheader("Perfil químico do experimento")
 st.caption(
-    "Classes químicas dos candidatos mais prováveis (Rank 1) segundo ChEBI. "
-    "Revela o perfil geral dos compostos identificados nesta análise."
+    "Classes químicas dos candidatos Rank 1 segundo PubChem / ChEBI. "
+    "Revela a natureza dos compostos identificados neste experimento."
 )
 
 if not classes_classif.empty:
-    top_classes = classes_classif.head(12).sort_values("Frequência", ascending=True)
+    _top_classes = classes_classif.head(12).sort_values("Frequência", ascending=True)
 
-    bar_classes = (
-        alt.Chart(top_classes)
-        .mark_bar(color="#5a9e6f", opacity=0.82, cornerRadiusTopRight=2, cornerRadiusBottomRight=2)
+    _bar_cl = (
+        alt.Chart(_top_classes)
+        .mark_bar(color="#5a9e6f", opacity=0.82,
+                  cornerRadiusTopRight=2, cornerRadiusBottomRight=2)
         .encode(
             y=alt.Y("Classe química:N", sort=None, title=None),
-            x=alt.X("Frequência:Q", title="Compostos classificados (Rank 1)"),
+            x=alt.X("Frequência:Q", title="Compostos Rank 1 nesta classe"),
             tooltip=[
                 alt.Tooltip("Classe química:N", title="Classe"),
                 alt.Tooltip("Frequência:Q", title="Compostos"),
             ],
         )
-        .properties(height=max(160, len(top_classes) * 32))
+        .properties(height=max(160, len(_top_classes) * 32))
     )
 
-    col_chart, col_stats = st.columns([3, 1])
-    with col_chart:
-        st.altair_chart(bar_classes, use_container_width=True)
+    _col_cl, _col_cl_stats = st.columns([3, 1])
+    with _col_cl:
+        st.altair_chart(_bar_cl, use_container_width=True)
 
-    with col_stats:
+    with _col_cl_stats:
         st.metric(
             "Classificados",
             f"{n_classif} / {n_compostos}",
@@ -511,110 +672,105 @@ if not classes_classif.empty:
         st.metric(
             "Sem classificação",
             n_nc,
-            help="Candidatos sem classe química documentada — comum em compostos emergentes ou pouco estudados",
+            help="Candidatos Rank 1 sem classe química documentada",
         )
-        if len(classes_classif) > 0:
-            classe_dom = classes_classif.iloc[0]["Classe química"]
-            freq_dom   = classes_classif.iloc[0]["Frequência"]
+        if cobertura_ext:
             st.metric(
-                "Classe predominante",
-                f"{freq_dom} comp.",
-                help=f"Classe mais frequente: {classe_dom}",
+                "Cobertura ChEBI",
+                f"{cobertura_ext.get('pct_chebi', 0):.0f}%",
+                help="% dos compostos Rank 1 com identificador ChEBI disponível em dim_molecula",
+            )
+            st.metric(
+                "Cobertura PubChem",
+                f"{cobertura_ext.get('pct_pubchem', 0):.0f}%",
+                help="% dos compostos Rank 1 com identificador PubChem disponível em dim_molecula",
             )
 
     st.caption(
-        "Classes predominantes revelam o perfil químico do experimento. "
         "Compostos sem classificação não indicam erro — são frequentes em substâncias emergentes "
         "ou de síntese não catalogadas nas bases públicas."
     )
 
 elif _tem_classes:
     st.info(
-        "Nenhum candidato mais provável possui classificação química documentada em bases públicas.  \n"
-        "Isso é comum em análises de compostos emergentes ou de síntese."
+        "Nenhum Rank 1 possui classificação química documentada.  \n"
+        "Comum em análises de compostos emergentes ou de síntese."
     )
 else:
     st.info("Dados de classificação química não disponíveis para esta análise.")
 
 st.divider()
 
-# ---------------------------------------------------------------------------
-# Seção 4 — Scores instrumentais (Rank 1)
-# ---------------------------------------------------------------------------
-_SCORE_COLS_LAB = ["Score Lab", "Score Fragmentacao", "Isotope Similarity"]
-_SCORE_LABELS   = {
-    "Score Lab":          "Score do instrumento",
-    "Score Fragmentacao": "Correspondência MS/MS",
-    "Isotope Similarity": "Padrão isotópico",
-}
-_cols_ok = [c for c in _SCORE_COLS_LAB if c in rank1_df.columns]
+# ===========================================================================
+# Distribuição de ambiguidade molecular — gráfico exploratório
+# ===========================================================================
+st.subheader("Distribuição de ambiguidade molecular")
+st.caption(
+    "Cada ponto representa um composto. "
+    "Eixo horizontal: número de candidatos; eixo vertical: score do Rank 1. "
+    "Passe o cursor para detalhes."
+)
 
-if len(_cols_ok) >= 2 and not rank1_df.empty:
-    st.subheader("Scores instrumentais — distribuição (Rank 1)")
-    st.caption(
-        "Distribuição dos sub-scores do instrumento para os candidatos mais prováveis. "
-        "Compara como cada critério se comporta ao longo do experimento."
+if len(compound_data) >= 2:
+    _sc = compound_data.dropna(subset=["pontuacao_rank1"]).copy()
+    _sc["pontuacao_rank1"] = _sc["pontuacao_rank1"].round(1)
+
+    _h_rule = (
+        alt.Chart(pd.DataFrame({"y": [70.0]}))
+        .mark_rule(color="#888888", strokeDash=[4, 4], opacity=0.35, size=1)
+        .encode(y="y:Q")
     )
-
-    scores_long = (
-        rank1_df[_cols_ok + ["Sinal"]]
-        .melt(id_vars="Sinal", var_name="Score", value_name="Valor")
+    _v_rule = (
+        alt.Chart(pd.DataFrame({"x": [float(compound_data["n_candidatos"].quantile(0.75))]}))
+        .mark_rule(color="#888888", strokeDash=[4, 4], opacity=0.35, size=1)
+        .encode(x="x:Q")
     )
-    scores_long["Score"] = scores_long["Score"].map(_SCORE_LABELS).fillna(scores_long["Score"])
-    scores_long["Valor"] = pd.to_numeric(scores_long["Valor"], errors="coerce")
-    scores_long = scores_long.dropna(subset=["Valor"])
-
-    # Médias por score (para anotação)
-    medias = scores_long.groupby("Score")["Valor"].mean().reset_index().rename(columns={"Valor": "Media"})
-
-    box_chart = (
-        alt.Chart(scores_long)
-        .mark_boxplot(extent="min-max", size=50, median=alt.MarkConfig(color="white", size=50))
+    _scatter = (
+        alt.Chart(_sc)
+        .mark_circle(opacity=0.78)
         .encode(
-            x=alt.X("Score:N", title=None, axis=alt.Axis(labelAngle=0)),
+            x=alt.X(
+                "n_candidatos:Q",
+                title="Candidatos moleculares",
+                scale=alt.Scale(zero=True),
+            ),
             y=alt.Y(
-                "Valor:Q",
-                title="Valor (0–100)",
+                "pontuacao_rank1:Q",
+                title="Score Rank 1",
                 scale=alt.Scale(domain=[0, 105]),
             ),
-            color=alt.Color(
-                "Score:N",
-                scale=alt.Scale(
-                    domain=list(_SCORE_LABELS.values()),
-                    range=["#4472c4", "#c0392b", "#5a9e6f"],
-                ),
+            size=alt.Size(
+                "n_candidatos:Q",
+                scale=alt.Scale(range=[50, 260]),
                 legend=None,
             ),
+            color=alt.Color(
+                "pontuacao_rank1:Q",
+                scale=alt.Scale(scheme="blues", domain=[0, 100]),
+                legend=alt.Legend(title="Score Rank 1", orient="right"),
+            ),
+            tooltip=[
+                alt.Tooltip("Sinal:N", title="Composto"),
+                alt.Tooltip("n_candidatos:Q", title="Candidatos"),
+                alt.Tooltip("pontuacao_rank1:Q", title="Score Rank 1", format=".1f"),
+                alt.Tooltip("melhor_candidato_curto:N", title="Rank 1"),
+            ],
         )
-        .properties(height=300)
+        .properties(height=320)
     )
-
-    media_points = (
-        alt.Chart(medias)
-        .mark_text(dy=-12, fontSize=11, fontWeight="bold")
-        .encode(
-            x=alt.X("Score:N"),
-            y=alt.Y("Media:Q"),
-            text=alt.Text("Media:Q", format=".1f"),
-            color=alt.Color("Score:N", scale=alt.Scale(
-                domain=list(_SCORE_LABELS.values()),
-                range=["#4472c4", "#c0392b", "#5a9e6f"],
-            ), legend=None),
-        )
+    st.altair_chart(
+        (_scatter + _h_rule + _v_rule).properties(height=320),
+        use_container_width=True,
     )
-
-    st.altair_chart((box_chart + media_points).properties(height=300), use_container_width=True)
     st.caption(
-        "Cada caixa mostra a mediana (linha branca), o intervalo interquartil (caixa) "
-        "e os valores mínimo e máximo (hastes) para o conjunto de compostos. "
-        "O número acima de cada caixa é a média do score. "
-        "Caixas estreitas indicam scores consistentes entre os compostos; "
-        "caixas largas revelam maior variabilidade."
+        "**Superior esquerdo** — poucos candidatos, alta pontuação: identificação clara.  \n"
+        "**Inferior direito** — muitos candidatos, baixa pontuação: alta ambiguidade, revisão prioritária."
     )
-
-    st.divider()
+else:
+    st.info("São necessários ao menos dois compostos para o gráfico de ambiguidade.")
 
 # ---------------------------------------------------------------------------
 # Rodapé
 # ---------------------------------------------------------------------------
+st.divider()
 st.caption("Omics ETL Pipeline · IST Ambiental / SENAI")
