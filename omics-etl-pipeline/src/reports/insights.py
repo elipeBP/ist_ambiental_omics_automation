@@ -13,6 +13,108 @@ import re
 import pandas as pd
 
 # ---------------------------------------------------------------------------
+# Classificação química amigável
+# ---------------------------------------------------------------------------
+
+# Mapeamento keyword → categoria PT-BR (ordem importa: mais específico primeiro)
+_CATEGORIA_RULES: list[tuple[list[str], str]] = [
+    # Peptídeos e derivados
+    (["cyclopeptide", "cyclic peptide", "orbitide"],           "Peptídeo Cíclico"),
+    (["polypeptide", "oligopeptide", "tetrapeptide",
+      "tripeptide", "dipeptide", "peptide"],                   "Peptídeo"),
+    # Aminoácidos
+    (["alpha-amino acid", "amino acid", "aminoacid",
+      "glutamine derivative", "leucine derivative",
+      "non-proteinogenic"],                                     "Aminoácido"),
+    # Lipídios
+    (["fatty acid", "lipid", "phospholipid", "sphingolipid",
+      "glycerolipid", "ceramide", "triacylglycerol",
+      "diacylglycerol", "lysophospholipid"],                   "Lipídio"),
+    # Carboidratos
+    (["monosaccharide", "disaccharide", "oligosaccharide",
+      "polysaccharide", "carbohydrate", "sugar", "glycan"],    "Carboidrato"),
+    # Flavonoides / Polifenóis
+    (["flavonoid", "flavone", "flavonol", "flavanone",
+      "isoflavone", "anthocyanin", "chalcone",
+      "4-coumarate", "phenylpropanoid"],                       "Flavonoide"),
+    # Esteroides
+    (["steroid", "sterol", "corticosteroid",
+      "3-oxo-delta", "glucocorticoid"],                        "Esteroide"),
+    # Alcaloides
+    (["alkaloid", "indolecarboxamide", "indole alkaloid",
+      "hydroxypiperidine", "isoquinoline", "purine alkaloid"], "Alcaloide"),
+    # Ácidos orgânicos
+    (["organic acid", "carboxylic acid", "dicarboxylic",
+      "monocarboxylic", "citrate", "benzoate", "malate",
+      "lactate", "acetate"],                                   "Ácido Orgânico"),
+    # Vitaminas / cofatores
+    (["vitamin", "coenzyme", "cofactor", "cobalamin"],         "Vitamina / Cofator"),
+    # Nucleosídeos / nucleotídeos
+    (["nucleoside", "nucleotide", "purine", "pyrimidine",
+      "adenosine", "guanosine", "cytidine"],                   "Nucleosídeo / Nucleotídeo"),
+    # Terpenoides
+    (["terpene", "terpenoid", "monoterpene",
+      "diterpene", "sesquiterpene", "triterpene"],              "Terpenoide"),
+    # Fosfatos orgânicos
+    (["organophosphate", "aryl phosphate",
+      "phosphate ester"],                                      "Fosfato Orgânico"),
+    # Halogenados
+    (["organofluorine", "organochlorine", "organobromine",
+      "haloalkyl", "organic chloride", "organic fluoride"],    "Halogenado"),
+    # Heterocíclicos (depois de alcaloides/nucleosídeos)
+    (["thiazole", "benzothiazole", "benzothiophene",
+      "imidazole", "quinoline", "oxazole", "furan",
+      "pyridine", "thiophene"],                                "Heterocíclico"),
+]
+
+# Abreviações de aminoácidos comuns — usadas na Camada 2 (heurística por nome)
+_AA_ABBREVS = {
+    "ala", "arg", "asn", "asp", "cys", "gln", "glu", "gly",
+    "his", "ile", "leu", "lys", "met", "phe", "pro", "ser",
+    "thr", "trp", "tyr", "val",
+}
+
+_NAO_CLASSIFICADO = "Não classificado"
+
+
+def classificar_categoria(classe_quimica: str, nome: str = "") -> str:
+    """
+    Converte o campo classe_quimica (termos ChEBI técnicos) em uma
+    categoria amigável em português.
+
+    Camada 1 — keyword matching em classe_quimica.
+    Camada 2 — heurística conservadora no nome da molécula.
+    Camada 3 — "Não classificado".
+
+    Nunca retorna None ou string vazia.
+    """
+    cq = (classe_quimica or "").strip().lower()
+    nm = (nome or "").strip().lower()
+
+    # Valores que indicam ausência de classificação
+    if cq in ("", "none", "nao classificada", "não classificada", "nao_classificada"):
+        cq = ""
+
+    # Camada 1 — keyword matching
+    if cq:
+        for keywords, categoria in _CATEGORIA_RULES:
+            if any(kw in cq for kw in keywords):
+                return categoria
+
+    # Camada 2 — heurística no nome (apenas quando Camada 1 falhou)
+    if nm:
+        # Nome no padrão de sequência peptídica: "ala-pro-arg-leu" etc.
+        partes = re.split(r"[-\s]", nm)
+        if len(partes) >= 2 and all(p in _AA_ABBREVS for p in partes if p):
+            return "Peptídeo (estimado)"
+        if "cyclo(" in nm:
+            return "Peptídeo Cíclico (estimado)"
+        if "acid" in nm and "amino" in nm:
+            return "Aminoácido (estimado)"
+
+    return _NAO_CLASSIFICADO
+
+# ---------------------------------------------------------------------------
 # Constantes: hierarquia IST de critérios de desempate
 # ---------------------------------------------------------------------------
 
@@ -156,24 +258,29 @@ def computar_insights(df: pd.DataFrame) -> dict:
         n_resolvidos     = 0
         n_nao_resolvidos = n_empates
 
-    # -- Classes químicas (Rank 1) -------------------------------------------
-    if _tem_classes:
-        _cl_raw = (
-            rank1_unico["Classe Quimica"]
-            .fillna("Não classificada")
-            .replace("Nao classificada", "Não classificada")
-        )
-        classes_cnt = _cl_raw.value_counts().reset_index()
-        classes_cnt.columns = ["Classe química", "Frequência"]
-        classes_classif = classes_cnt[classes_cnt["Classe química"] != "Não classificada"]
-        n_nc      = int(
-            classes_cnt.loc[classes_cnt["Classe química"] == "Não classificada", "Frequência"]
-            .sum()
-        )
-        n_classif = int(classes_classif["Frequência"].sum())
+    # -- Categorias químicas amigáveis (Rank 1) ---------------------------------
+    # Usa "Categoria" se disponível (adicionada por utils.py), senão deriva ao voo.
+    _NAO_CLASS = "Não classificado"
+    if "Categoria" in rank1_unico.columns:
+        _cat_raw = rank1_unico["Categoria"].fillna(_NAO_CLASS)
+    elif "Classe Quimica" in rank1_unico.columns:
+        _nom_col = rank1_unico["Candidato"] if "Candidato" in rank1_unico.columns else pd.Series([""] * len(rank1_unico))
+        _cat_raw = pd.Series([
+            classificar_categoria(cq, nm)
+            for cq, nm in zip(
+                rank1_unico["Classe Quimica"].fillna(""),
+                _nom_col.fillna(""),
+            )
+        ], index=rank1_unico.index)
     else:
-        classes_cnt = classes_classif = pd.DataFrame()
-        n_nc = n_classif = 0
+        _cat_raw = pd.Series([_NAO_CLASS] * len(rank1_unico))
+
+    _tem_classes = True  # sempre há categoria (com fallback)
+    classes_cnt = _cat_raw.value_counts().reset_index()
+    classes_cnt.columns = ["Classe química", "Frequência"]
+    classes_classif = classes_cnt[classes_cnt["Classe química"] != _NAO_CLASS]
+    n_nc      = int(classes_cnt.loc[classes_cnt["Classe química"] == _NAO_CLASS, "Frequência"].sum())
+    n_classif = int(classes_classif["Frequência"].sum())
 
     pct_classif = n_classif / n_compostos * 100 if n_compostos else 0.0
 

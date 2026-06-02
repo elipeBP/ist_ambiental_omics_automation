@@ -14,7 +14,22 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.reports.insights import classificar_categoria
+
 logger = logging.getLogger(__name__)
+
+
+def _adicionar_categoria(df: pd.DataFrame) -> pd.DataFrame:
+    """Adiciona coluna 'Categoria' com classificação química amigável."""
+    if df.empty:
+        return df
+    cq  = df.get("Classe Quimica",  pd.Series([""] * len(df))).fillna("")
+    nm  = df.get("Candidato",        pd.Series([""] * len(df))).fillna("")
+    df  = df.copy()
+    df["Categoria"] = [
+        classificar_categoria(c, n) for c, n in zip(cq, nm)
+    ]
+    return df
 
 _BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DB_PATH   = _BASE_DIR / "banco_ist.db"
@@ -34,7 +49,8 @@ def carregar_ranking() -> pd.DataFrame:
         return pd.DataFrame()
     try:
         conn = sqlite3.connect(DB_PATH)
-        return pd.read_sql_query('SELECT * FROM "vw_ranking_candidatos"', conn)
+        df = pd.read_sql_query('SELECT * FROM "vw_ranking_candidatos"', conn)
+        return _adicionar_categoria(df)
     except Exception as e:
         logger.error(f"Erro ao carregar ranking: {e}")
         return pd.DataFrame()
@@ -52,11 +68,12 @@ def carregar_sinal(sinal: str) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         conn = sqlite3.connect(DB_PATH)
-        return pd.read_sql_query(
+        df = pd.read_sql_query(
             'SELECT * FROM "vw_ranking_candidatos" WHERE "Sinal" = ? ORDER BY "Rank"',
             conn,
             params=(sinal,),
         )
+        return _adicionar_categoria(df)
     except Exception as e:
         logger.error(f"Erro ao carregar sinal '{sinal}': {e}")
         return pd.DataFrame()
@@ -131,11 +148,12 @@ def carregar_ranking_batch(batch_id: int) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         conn = sqlite3.connect(DB_PATH)
-        return pd.read_sql_query(
+        df = pd.read_sql_query(
             'SELECT * FROM "vw_ranking_historico" WHERE "Batch ID" = ? ORDER BY "Sinal", "Rank"',
             conn,
             params=(batch_id,),
         )
+        return _adicionar_categoria(df)
     except Exception as e:
         logger.error(f"Erro ao carregar ranking do batch {batch_id}: {e}")
         return pd.DataFrame()

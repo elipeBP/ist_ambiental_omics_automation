@@ -281,7 +281,7 @@ with st.expander("ℹ️ Como interpretar estes resultados", expanded=False):
 # ---------------------------------------------------------------------------
 # Visão geral — tabela principal
 # ---------------------------------------------------------------------------
-COLUNAS_RESUMO = ["Sinal", "m/z Medido", "Candidato", score_col, "Score Qualidade Dados", "Rank"]
+COLUNAS_RESUMO = ["Sinal", "m/z Medido", "Candidato", "Categoria", score_col, "Score Qualidade Dados", "Rank"]
 COLUNAS_RESUMO = [c for c in COLUNAS_RESUMO if c in df_completo.columns]
 
 st.subheader("Todos os candidatos do experimento")
@@ -309,6 +309,10 @@ st.dataframe(
         "Candidato": st.column_config.TextColumn(
             "Candidato molecular",
             help="Nome do composto sugerido como possível identidade deste sinal. Pode haver múltiplos candidatos por composto detectado.",
+        ),
+        "Categoria": st.column_config.TextColumn(
+            "Categoria química",
+            help="Classificação química amigável derivada dos dados ChEBI. Facilita a interpretação rápida do tipo de composto identificado.",
         ),
         score_col: st.column_config.ProgressColumn(
             "Pontuação de identificação",
@@ -349,10 +353,12 @@ if sinal_escolhido != opcao_todos:
     else:
         melhor = df_detalhe[df_detalhe["Rank"] == 1]
         if not melhor.empty:
-            nome_melhor  = melhor.iloc[0]["Candidato"]
-            score_melhor = melhor.iloc[0].get(score_col, melhor.iloc[0].get("Score Total", 0))
+            nome_melhor     = melhor.iloc[0]["Candidato"]
+            score_melhor    = melhor.iloc[0].get(score_col, melhor.iloc[0].get("Score Total", 0))
+            categoria_melhor = melhor.iloc[0].get("Categoria", "")
+            categoria_str   = f"  \nCategoria química: **{categoria_melhor}**" if categoria_melhor else ""
             st.success(
-                f"**Candidato mais provável (Rank 1):** {nome_melhor}  \n"
+                f"**Candidato mais provável (Rank 1):** {nome_melhor}{categoria_str}  \n"
                 f"Pontuação de identificação: **{score_melhor:.1f} / 100**  \n"
                 "Este é o composto considerado mais compatível com o sinal pelo instrumento. "
                 "Recomenda-se confirmação por especialista antes de reportar."

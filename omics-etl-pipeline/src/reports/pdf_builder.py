@@ -482,9 +482,9 @@ def _sec_chart_classes(ins: dict, cobertura_ext: dict, styles: dict) -> list:
         n_nc      = ins["n_nc"]
         n_comp    = ins["n_compostos"]
         cap_parts = [
-            f"Classes químicas dos candidatos Rank 1 (ChEBI). "
+            f"Categorias químicas dos candidatos Rank 1. "
             f"{n_classif} de {n_comp} compostos classificados. "
-            f"{n_nc} sem classificação documentada.",
+            f"{n_nc} sem classificação disponível.",
         ]
         elems.append(Paragraph(" ".join(cap_parts), styles["Caption"]))
 
@@ -502,7 +502,7 @@ def _sec_tabela_rank1(ins: dict, styles: dict) -> list:
 
     # Enriquece compound_data com colunas extras do rank1_unico
     _extra_cols = ["Sinal"]
-    for col in ["Formula", "Classe Quimica", "Criterio Desempate", "Empate"]:
+    for col in ["Formula", "Categoria", "Classe Quimica", "Criterio Desempate", "Empate"]:
         if col in rank1_unico.columns:
             _extra_cols.append(col)
     rank1_extra = rank1_unico[_extra_cols].reset_index(drop=True)
@@ -515,7 +515,11 @@ def _sec_tabela_rank1(ins: dict, styles: dict) -> list:
     headers = ["Composto", "Candidato Rank 1", "Score"]
     col_ws  = [2.8 * cm, 5.5 * cm, 1.5 * cm]
 
-    if _tem_classes and "Classe Quimica" in tbl_df.columns:
+    # Usa Categoria (amigável) se disponível, senão Classe Quimica (ChEBI técnico)
+    if "Categoria" in tbl_df.columns:
+        headers.insert(2, "Categoria")
+        col_ws.insert(2, 2.8 * cm)
+    elif _tem_classes and "Classe Quimica" in tbl_df.columns:
         headers.insert(2, "Classe")
         col_ws.insert(2, 2.8 * cm)
 
@@ -570,7 +574,9 @@ def _sec_tabela_rank1(ins: dict, styles: dict) -> list:
 
         if "Fórmula" in headers:
             data_row.append(Paragraph(_trunc(str(row.get("Formula") or "—"), 15), styles["TableCell"]))
-        if "Classe" in headers:
+        if "Categoria" in headers:
+            data_row.append(Paragraph(_trunc(str(row.get("Categoria") or "—"), 28), styles["TableCell"]))
+        elif "Classe" in headers:
             data_row.append(Paragraph(_trunc(str(row.get("Classe Quimica") or "—"), 30), styles["TableCell"]))
 
         data_row.append(Paragraph(score_str, ParagraphStyle(
