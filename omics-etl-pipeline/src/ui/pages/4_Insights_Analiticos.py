@@ -20,7 +20,8 @@ import streamlit as st
 _ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from src.reports.insights import CRITERIO_LABEL, computar_insights
+from src.reports.insights import computar_insights
+from src.reports.narrative import gerar_narrativa
 from src.ui.utils import (
     carregar_cobertura_externa,
     carregar_ranking,
@@ -178,216 +179,20 @@ if batch_id_real is not None:
 pct_chebi = cobertura_ext.get("pct_chebi", 0)
 
 # ---------------------------------------------------------------------------
-# Funções auxiliares v2
+# Narrativa — interpretação automática centralizada
 # ---------------------------------------------------------------------------
 
-def _calcular_status(mean_p: float, pct_emp: float, pct_ch: float) -> str:
-    if mean_p < 45 or pct_emp > 40:
-        return "inconclusivo"
-    if mean_p >= 70 and pct_emp <= 15 and pct_ch >= 50:
-        return "conclusivo"
-    return "parcial"
-
-
-def _calcular_risco(mean_p: float, pct_emp: float) -> tuple[str, str]:
-    if mean_p < 45 or pct_emp > 40:
-        return "Elevado", "Score médio abaixo de 45 ou mais de 40% dos compostos em empate"
-    if mean_p >= 70 and pct_emp <= 15:
-        return "Baixo", "Boa confiança geral com poucos empates"
-    return "Moderado", "Confiança ou proporção de empates em nível intermediário"
-
-
-def _gerar_paragrafo(ins: dict, cobertura_ext: dict) -> str:
-    n       = ins["n_compostos"]
-    score   = ins["mean_pontuacao"]
-    n_emp   = ins["n_empates"]
-    pct_emp = ins["pct_empates"]
-    c_dom   = ins.get("criterio_dom")
-    c_dom_n = ins.get("criterio_dom_n", 0)
-    cl      = ins.get("classes_classif", pd.DataFrame())
-    pct_ch  = cobertura_ext.get("pct_chebi", 0) if cobertura_ext else 0
-
-    conf = (
-        f"boa confiança ({score:.1f}/100)" if score >= 70
-        else f"confiança moderada ({score:.1f}/100)" if score >= 45
-        else f"baixa confiança ({score:.1f}/100)"
-    )
-
-    partes = [f"Este experimento identificou **{n} compostos** com {conf}."]
-
-    if c_dom and c_dom_n > 0:
-        lbl = CRITERIO_LABEL.get(c_dom, c_dom).lower()
-        partes.append(
-            f"O critério de {lbl} foi determinante em {c_dom_n} identificações, "
-            "indicando qualidade espectral aceitável."
-        )
-
-    if ins.get("_tem_empate", False):
-        if n_emp == 0:
-            partes.append(
-                "Todos os compostos foram identificados automaticamente, sem empates."
-            )
-        elif n_emp == 1:
-            partes.append(
-                "**1 composto** não pôde ser identificado automaticamente "
-                "e requer avaliação do especialista."
-            )
-        else:
-            partes.append(
-                f"**{n_emp} compostos ({pct_emp:.0f}%)** não puderam ser identificados "
-                "automaticamente e requerem avaliação do especialista."
-            )
-
-    if not cl.empty:
-        cls = cl.iloc[0]["Classe química"]
-        frq = int(cl.iloc[0]["Frequência"])
-        if cls != "Não classificado":
-            partes.append(
-                f"O perfil químico é dominado por **{cls.lower()}** ({frq} de {n} compostos)."
-            )
-
-    if pct_ch > 0:
-        if pct_ch >= 70:
-            partes.append(f"Cobertura de bases externas boa (ChEBI {pct_ch:.0f}%).")
-        elif pct_ch >= 40:
-            partes.append(
-                f"Cobertura de bases externas parcial (ChEBI {pct_ch:.0f}%), "
-                "esperada para amostras com compostos emergentes."
-            )
-        else:
-            partes.append(
-                f"Cobertura de bases externas limitada (ChEBI {pct_ch:.0f}%) — "
-                "muitos compostos não estão catalogados em bases públicas."
-            )
-
-    return " ".join(partes)
-
-
-def _gerar_conclusao(
-    status_key: str,
-    n_criticos: int,
-    n_atencao: int,
-    n_compostos: int,
-    n_alta_conf: int,
-) -> str:
-    if status_key == "conclusivo":
-        return (
-            f"Resultado conclusivo. {n_alta_conf} de {n_compostos} compostos "
-            "com alta confiança de identificação."
-        )
-    if status_key == "inconclusivo":
-        return (
-            "Resultado inconclusivo. Revisão detalhada pelo especialista "
-            "recomendada antes de reportar qualquer identificação."
-        )
-    partes = ["Resultado aceitável."]
-    if n_criticos > 0:
-        partes.append(
-            f"Revisão manual necessária em {n_criticos} composto(s) em empate."
-        )
-    if n_atencao > 0:
-        partes.append(f"{n_atencao} composto(s) com baixa confiança requerem atenção.")
-    return " ".join(partes)
-
-
-def _build_priority_table(
-    compound_data: pd.DataFrame,
-    rank1_unico: pd.DataFrame,
-    rank1_df: pd.DataFrame,
-    emp_sinais: set,
-) -> pd.DataFrame:
-    """Constrói tabela de compostos ordenada por prioridade de revisão."""
-    _extra_cols = ["Sinal"]
-    for col in ["Empate", "Categoria"]:
-        if col in rank1_unico.columns:
-            _extra_cols.append(col)
-    extra = rank1_unico[_extra_cols].drop_duplicates("Sinal").reset_index(drop=True)
-
-    n_tied = rank1_df.groupby("Sinal").size().to_dict()
-
-    tbl = (
-        compound_data[["Sinal", "pontuacao_rank1", "melhor_candidato_curto"]]
-        .merge(extra, on="Sinal", how="left")
-        .copy()
-    )
-
-    prioridade_col: list = []
-    ordem_col: list      = []
-    situacao_col: list   = []
-
-    for _, row in tbl.iterrows():
-        sinal  = row["Sinal"]
-        empate = sinal in emp_sinais
-        score  = pd.to_numeric(row.get("pontuacao_rank1"), errors="coerce")
-        score  = float(score) if pd.notna(score) else 100.0
-
-        if empate:
-            n_t = n_tied.get(sinal, 2)
-            prioridade_col.append("🔴 Alta")
-            ordem_col.append(3)
-            situacao_col.append(f"Empate — {n_t} candidatos")
-        elif score < 45:
-            prioridade_col.append("🟡 Média")
-            ordem_col.append(2)
-            situacao_col.append("Baixa confiança")
-        elif score >= 80:
-            prioridade_col.append("✅ OK")
-            ordem_col.append(0)
-            situacao_col.append("Alta confiança")
-        else:
-            prioridade_col.append("—")
-            ordem_col.append(1)
-            situacao_col.append("Confiança moderada")
-
-    tbl["Prioridade"] = prioridade_col
-    tbl["_ordem"]     = ordem_col
-    tbl["Situação"]   = situacao_col
-    tbl["Confiança"]  = pd.to_numeric(tbl["pontuacao_rank1"], errors="coerce").round(1)
-
-    tbl = tbl.sort_values(["_ordem", "pontuacao_rank1"], ascending=[False, True])
-
-    out_cols   = ["Prioridade", "Sinal", "Confiança"]
-    col_rename = {"Sinal": "Composto"}
-
-    if "Categoria" in tbl.columns:
-        out_cols.append("Categoria")
-
-    out_cols += ["Situação", "melhor_candidato_curto"]
-    col_rename["melhor_candidato_curto"] = "Candidato mais provável"
-
-    return (
-        tbl[out_cols]
-        .rename(columns=col_rename)
-        .reset_index(drop=True)
-    )
-
-
-# ---------------------------------------------------------------------------
-# Cálculos principais v2
-# ---------------------------------------------------------------------------
-
-# Empates
-_emp_sinais: set = set()
-if _tem_empate and not rank1_unico.empty:
-    _emp_num    = pd.to_numeric(rank1_unico["Empate"], errors="coerce").fillna(0)
-    _emp_sinais = set(rank1_unico[_emp_num > 0]["Sinal"].tolist())
-
-# Compostos com baixa confiança que NÃO estão em empate
-_scores_sinal = (
-    compound_data.set_index("Sinal")["pontuacao_rank1"]
-    .apply(lambda x: pd.to_numeric(x, errors="coerce"))
-)
-_low_sinais = set(_scores_sinal[_scores_sinal < 45].index.tolist()) - _emp_sinais
-
-n_criticos = len(_emp_sinais)
-n_atencao  = len(_low_sinais)
-n_revisar  = n_criticos + n_atencao
-
-status_key              = _calcular_status(mean_pontuacao, pct_empates, pct_chebi)
-risco_label, risco_desc = _calcular_risco(mean_pontuacao, pct_empates)
-paragrafo_txt           = _gerar_paragrafo(ins, cobertura_ext)
-conclusao_txt           = _gerar_conclusao(status_key, n_criticos, n_atencao, n_compostos, n_alta_conf)
-priority_df             = _build_priority_table(compound_data, rank1_unico, rank1_df, _emp_sinais)
+nar           = gerar_narrativa(ins, cobertura_ext)
+status_key    = nar["status"]
+risco_label   = nar["risco_label"]
+risco_desc    = nar["risco_desc"]
+paragrafo_txt = nar["paragrafo"]
+conclusao_txt = nar["conclusao"]
+n_criticos    = nar["n_criticos"]
+n_atencao     = nar["n_atencao"]
+n_revisar     = nar["n_revisar"]
+priority_df   = nar["priority_df"]
+_emp_sinais   = ins.get("emp_sinais", frozenset())
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ZONA 1 — DIAGNÓSTICO

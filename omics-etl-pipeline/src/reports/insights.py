@@ -143,8 +143,8 @@ CRITERIO_COLOR = {
     "empate_humano": "#e57373",
 }
 
-_SCORE_TIER_ALTA     = 80
-_SCORE_TIER_MODERADA = 45
+SCORE_TIER_ALTA     = 80
+SCORE_TIER_MODERADA = 45
 
 
 # ---------------------------------------------------------------------------
@@ -207,17 +207,19 @@ def computar_insights(df: pd.DataFrame) -> dict:
     )
     mean_cand_comp = n_candidatos_tot / n_compostos if n_compostos else 0.0
     n_alta_conf    = int(
-        (pd.to_numeric(rank1_unico[score_col], errors="coerce") >= _SCORE_TIER_ALTA).sum()
+        (pd.to_numeric(rank1_unico[score_col], errors="coerce") >= SCORE_TIER_ALTA).sum()
     )
 
     # -- Empates -------------------------------------------------------------
     if _tem_empate and not rank1_unico.empty:
-        _emp_num  = pd.to_numeric(rank1_unico["Empate"], errors="coerce").fillna(0)
+        _emp_num    = pd.to_numeric(rank1_unico["Empate"], errors="coerce").fillna(0)
         n_empates   = int((_emp_num > 0).sum())
         pct_empates = n_empates / n_compostos * 100 if n_compostos else 0.0
+        emp_sinais  = frozenset(rank1_unico[_emp_num > 0]["Sinal"].tolist())
     else:
         n_empates   = 0
         pct_empates = 0.0
+        emp_sinais  = frozenset()
 
     # -- Critérios de desempate ----------------------------------------------
     if _tem_criterio and not rank1_unico.empty:
@@ -310,6 +312,7 @@ def computar_insights(df: pd.DataFrame) -> dict:
         "n_alta_conf":      n_alta_conf,
         "n_empates":        n_empates,
         "pct_empates":      pct_empates,
+        "emp_sinais":       emp_sinais,
         # Critérios
         "criterio_counts":  criterio_counts,
         "criterio_dom":     criterio_dom,
@@ -328,8 +331,8 @@ def computar_insights(df: pd.DataFrame) -> dict:
         "CRITERIO_LABEL": CRITERIO_LABEL,
         "CRITERIO_COLOR": CRITERIO_COLOR,
         "CRITERIO_ORDER": CRITERIO_ORDER,
-        "SCORE_TIER_ALTA":     _SCORE_TIER_ALTA,
-        "SCORE_TIER_MODERADA": _SCORE_TIER_MODERADA,
+        "SCORE_TIER_ALTA":     SCORE_TIER_ALTA,
+        "SCORE_TIER_MODERADA": SCORE_TIER_MODERADA,
     }
 
 
