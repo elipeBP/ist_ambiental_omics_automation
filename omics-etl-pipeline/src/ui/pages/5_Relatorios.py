@@ -11,8 +11,10 @@ _ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from src.reports.insights import computar_insights
+from src.reports.narrative import gerar_narrativa
 from src.reports.pdf_analitico import gerar_relatorio_analitico
 from src.reports.pdf_executivo import gerar_relatorio_executivo
+from src.reports.xlsx_export import gerar_exportacao_xlsx
 from src.ui.utils import (
     carregar_cobertura_externa,
     carregar_ranking,
@@ -145,12 +147,13 @@ st.divider()
 # ---------------------------------------------------------------------------
 st.subheader("Tipo de relatório")
 
-_TIPO_RA = "📊 Relatório Analítico"
-_TIPO_RE = "📋 Relatório Executivo"
+_TIPO_RA   = "📊 Relatório Analítico"
+_TIPO_RE   = "📋 Relatório Executivo"
+_TIPO_XLSX = "📥 Exportação de Dados"
 
 tipo_sel = st.radio(
     "Selecionar tipo:",
-    options=[_TIPO_RA, _TIPO_RE],
+    options=[_TIPO_RA, _TIPO_RE, _TIPO_XLSX],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -169,7 +172,7 @@ with col_desc_l:
                 "- Detalhamento de empates e nota metodológica  \n"
                 "- Multi-página · linguagem técnica"
             )
-    else:
+    elif tipo_sel == _TIPO_RE:
         with st.container(border=True):
             st.markdown("**📋 Relatório Executivo**")
             st.caption("Para gestores, coordenadores e reuniões de gestão.")
@@ -179,6 +182,18 @@ with col_desc_l:
                 "- Perfil químico simplificado  \n"
                 "- Recomendação de ação em destaque  \n"
                 "- 1–2 páginas · sem scores técnicos"
+            )
+    else:
+        with st.container(border=True):
+            st.markdown("**📥 Exportação de Dados**")
+            st.caption("Para análise, arquivo e integração com outros sistemas.")
+            st.markdown(
+                "- **6 abas:** Resumo · Resultado Final · Para Revisão · "
+                "Dados Técnicos · Estatísticas · Metadados  \n"
+                "- Uma linha por composto (Rank 1) com scores completos  \n"
+                "- Lista de compostos para revisão com ação recomendada  \n"
+                "- Tabela técnica com todos os candidatos e ranks  \n"
+                "- Compatível com Excel e LibreOffice · gerado em memória"
             )
 
 with col_desc_r:
@@ -199,6 +214,9 @@ _STATE_KEY_FILENAME = "pdf_filename_ra"
 _STATE_KEY_BYTES_RE    = "pdf_bytes_re"
 _STATE_KEY_BATCH_RE    = "pdf_batch_id_re"
 _STATE_KEY_FILENAME_RE = "pdf_filename_re"
+_STATE_KEY_BYTES_XLSX    = "xlsx_bytes"
+_STATE_KEY_BATCH_XLSX    = "xlsx_batch_id"
+_STATE_KEY_FILENAME_XLSX = "xlsx_filename"
 
 # Invalida cache quando a análise muda
 if st.session_state.get(_STATE_KEY_BATCH) != batch_id_real:
@@ -210,6 +228,11 @@ if st.session_state.get(_STATE_KEY_BATCH_RE) != batch_id_real:
     st.session_state[_STATE_KEY_BYTES_RE]    = None
     st.session_state[_STATE_KEY_BATCH_RE]    = None
     st.session_state[_STATE_KEY_FILENAME_RE] = None
+
+if st.session_state.get(_STATE_KEY_BATCH_XLSX) != batch_id_real:
+    st.session_state[_STATE_KEY_BYTES_XLSX]    = None
+    st.session_state[_STATE_KEY_BATCH_XLSX]    = None
+    st.session_state[_STATE_KEY_FILENAME_XLSX] = None
 
 st.subheader("Gerar relatório")
 col_btn, col_status = st.columns([1, 2])
@@ -267,7 +290,7 @@ if tipo_sel == _TIPO_RA:
             _c4.metric("Score médio", f"{ins_prev['mean_pontuacao']:.1f}")
 
 # ── Relatório Executivo ────────────────────────────────────────────────────
-else:
+elif tipo_sel == _TIPO_RE:
     with col_btn:
         _gerar_re = st.button(
             "📋 Gerar Relatório Executivo",
@@ -305,6 +328,50 @@ else:
             data=_pdf_bytes_re,
             file_name=_filename_re,
             mime="application/pdf",
+            type="primary",
+            use_container_width=False,
+        )
+
+# ── Exportação XLSX ───────────────────────────────────────────────────────
+else:
+    with col_btn:
+        _gerar_xlsx = st.button(
+            "📥 Gerar Exportação XLSX",
+            type="primary",
+            use_container_width=True,
+            help="Gera a planilha Excel consolidada com 6 abas em memória.",
+        )
+
+    if _gerar_xlsx:
+        with st.spinner("Gerando Exportação XLSX..."):
+            try:
+                ins           = computar_insights(df)
+                cobertura_ext = carregar_cobertura_externa(batch_id_real) if batch_id_real else {}
+                nar           = gerar_narrativa(ins, cobertura_ext)
+                xlsx_bytes    = gerar_exportacao_xlsx(ins, nar, batch_info, cobertura_ext)
+                bid_str       = f"batch{batch_id_real}" if batch_id_real else "recente"
+                filename      = f"resultado_omics_{bid_str}.xlsx"
+
+                st.session_state[_STATE_KEY_BYTES_XLSX]    = xlsx_bytes
+                st.session_state[_STATE_KEY_BATCH_XLSX]    = batch_id_real
+                st.session_state[_STATE_KEY_FILENAME_XLSX] = filename
+            except Exception as exc:
+                st.error(f"Erro ao gerar a exportação:  \n`{exc}`")
+
+    _xlsx_bytes = st.session_state.get(_STATE_KEY_BYTES_XLSX)
+    _filename_x = st.session_state.get(_STATE_KEY_FILENAME_XLSX, "resultado_omics.xlsx")
+
+    if _xlsx_bytes:
+        with col_status:
+            st.success(
+                f"Exportação XLSX gerada — **{len(_xlsx_bytes) / 1024:.0f} KB**  \n"
+                "Clique abaixo para baixar."
+            )
+        st.download_button(
+            label="⬇ Baixar Exportação XLSX",
+            data=_xlsx_bytes,
+            file_name=_filename_x,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=False,
         )

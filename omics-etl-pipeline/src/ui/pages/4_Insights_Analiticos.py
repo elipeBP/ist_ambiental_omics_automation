@@ -2,13 +2,16 @@
 Página: Diagnóstico do Experimento
 Painel de apoio à decisão analítica — IST Ambiental / SENAI.
 
-Arquitetura v2:
-  Zona 1 — Diagnóstico  : status global + parágrafo + ações recomendadas
-  Zona 2 — O que fazer  : tabela de prioridades + detalhe de empates
-  Zona 3 — Análise      : gráficos exploratórios (expander fechado)
+Arquitetura v4:
+  Seção 1 — Status          : badge semafórico + diagnóstico textual
+  Seção 2 — Diagnóstico     : tabela automática de dimensões (6 indicadores)
+  Seção 3 — Ações           : cards com denominadores + bullets + recomendação
+  Seção 4 — Prioridades     : tabela de compostos + empates expandido automaticamente
+  Seção 5 — Relatórios      : CTA para exportação
+  Seção 6 — Evidências      : gráficos exploratórios (expander fechado)
 
-Computação delegada para src.reports.insights.computar_insights(),
-compartilhada com o gerador de relatórios PDF.
+Computação delegada para src.reports.insights.computar_insights() +
+src.reports.narrative.gerar_narrativa(), compartilhadas com os geradores PDF.
 """
 import sys
 from pathlib import Path
@@ -37,7 +40,7 @@ st.set_page_config(
 )
 
 st.title("🔬 Diagnóstico do Experimento")
-st.caption("Avaliação analítica automática dos resultados | IST Ambiental / SENAI")
+st.caption("Painel de apoio à decisão analítica | IST Ambiental / SENAI")
 st.divider()
 
 # ---------------------------------------------------------------------------
@@ -163,14 +166,12 @@ classes_classif  = ins["classes_classif"]
 n_nc             = ins["n_nc"]
 n_classif        = ins["n_classif"]
 n_alta_conf      = ins["n_alta_conf"]
+insights_list    = ins.get("insights", [])
 
 batch_info = (
     next((b for b in batches_sucesso if b["id"] == batch_sel), None)
     if batch_sel else None
 )
-if batch_info:
-    d_raw = (batch_info.get("iniciado_em") or "")[:16].replace("T", " ")
-    st.info(f"**Análise #{batch_info['id']}** — {d_raw} | {batch_info['nome_ident']}")
 
 cobertura_ext: dict = {}
 if batch_id_real is not None:
@@ -181,21 +182,22 @@ pct_chebi = cobertura_ext.get("pct_chebi", 0)
 # ---------------------------------------------------------------------------
 # Narrativa — interpretação automática centralizada
 # ---------------------------------------------------------------------------
-
-nar           = gerar_narrativa(ins, cobertura_ext)
-status_key    = nar["status"]
-risco_label   = nar["risco_label"]
-risco_desc    = nar["risco_desc"]
-paragrafo_txt = nar["paragrafo"]
-conclusao_txt = nar["conclusao"]
-n_criticos    = nar["n_criticos"]
-n_atencao     = nar["n_atencao"]
-n_revisar     = nar["n_revisar"]
-priority_df   = nar["priority_df"]
-_emp_sinais   = ins.get("emp_sinais", frozenset())
+nar              = gerar_narrativa(ins, cobertura_ext)
+status_key       = nar["status"]
+risco_label      = nar["risco_label"]
+risco_desc       = nar["risco_desc"]
+paragrafo_txt    = nar["paragrafo"]
+conclusao_txt    = nar["conclusao"]
+n_criticos       = nar["n_criticos"]
+n_atencao        = nar["n_atencao"]
+n_revisar        = nar["n_revisar"]
+priority_df      = nar["priority_df"]
+dimensoes        = nar["dimensoes"]
+recomendacao_txt = nar["recomendacao"]
+_emp_sinais      = ins.get("emp_sinais", frozenset())
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ZONA 1 — DIAGNÓSTICO
+# LAYOUT — construção baseada em dados já computados
 # ═══════════════════════════════════════════════════════════════════════════
 
 _STATUS_FN = {
@@ -208,32 +210,81 @@ _STATUS_LBL = {
     "parcial":      "🟡  ANÁLISE PARCIALMENTE CONCLUSIVA",
     "inconclusivo": "🔴  ANÁLISE INCONCLUSIVA",
 }
+_INSIGHT_FN = {
+    "success": st.success,
+    "warning": st.warning,
+    "info":    st.info,
+    "error":   st.error,
+}
 
-with st.container(border=True):
-    _STATUS_FN[status_key](f"**{_STATUS_LBL[status_key]}**")
-    st.markdown(paragrafo_txt)
-    st.markdown(f"**▸** {conclusao_txt}")
+# ---------------------------------------------------------------------------
+# Header contextual — identificação da análise em curso
+# ---------------------------------------------------------------------------
+if batch_info:
+    d_raw = (batch_info.get("iniciado_em") or "")[:16].replace("T", " ")
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.markdown(f"**Análise**  \n#{batch_info['id']}")
+        c2.markdown(f"**Processado em**  \n{d_raw}")
+        c3.markdown(f"**Arquivo**  \n{batch_info.get('nome_ident', '—')}")
+        _sinais = batch_info.get("total_sinais")
+        _cands  = batch_info.get("total_candidatos")
+        c4.markdown(
+            f"**Dados**  \n"
+            f"{_sinais if _sinais is not None else '—'} compostos · "
+            f"{_cands if _cands is not None else '—'} candidatos"
+        )
+else:
+    st.caption("Análise mais recente com sucesso.")
 
-st.markdown("")
+# ═══════════════════════════════════════════════════════════════════════════
+# SEÇÃO 1 — STATUS DA ANÁLISE
+# ═══════════════════════════════════════════════════════════════════════════
+st.divider()
+_STATUS_FN[status_key](f"**{_STATUS_LBL[status_key]}**")
+st.markdown(paragrafo_txt)
+st.markdown(f"**Conclusão:** {conclusao_txt}")
 
-# 3 indicadores de ação
+# ═══════════════════════════════════════════════════════════════════════════
+# SEÇÃO 2 — DIAGNÓSTICO AUTOMÁTICO
+# ═══════════════════════════════════════════════════════════════════════════
+if dimensoes:
+    st.divider()
+    st.subheader("Diagnóstico Automático")
+    dim_df = pd.DataFrame(dimensoes, columns=["Dimensão", "Valor", "Interpretação"])
+    st.dataframe(
+        dim_df,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Dimensão":     st.column_config.TextColumn("Dimensão",     width="medium"),
+            "Valor":        st.column_config.TextColumn("Valor",        width="small"),
+            "Interpretação":st.column_config.TextColumn("Interpretação",width="large"),
+        },
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SEÇÃO 3 — AÇÕES RECOMENDADAS
+# ═══════════════════════════════════════════════════════════════════════════
+st.divider()
+st.subheader("Ações Recomendadas")
+
+pct_alt = n_alta_conf / n_compostos * 100 if n_compostos else 0
+
 c1, c2, c3 = st.columns(3)
 with c1:
     with st.container(border=True):
         st.metric(
-            "Revisão necessária",
-            n_revisar,
-            help=(
-                f"{n_criticos} composto(s) em empate no Rank 1 e "
-                f"{n_atencao} com confiança abaixo de 45."
-            ),
+            "Para revisão",
+            f"{n_revisar} de {n_compostos}",
+            help=f"{n_criticos} em empate · {n_atencao} com baixa confiança",
         )
 with c2:
     with st.container(border=True):
         st.metric(
             "Alta confiança",
-            n_alta_conf,
-            help="Compostos com score de identificação acima de 80.",
+            f"{n_alta_conf} ({pct_alt:.0f}%)",
+            help="Score de identificação ≥ 80",
         )
 with c3:
     with st.container(border=True):
@@ -243,18 +294,19 @@ with c3:
             help=risco_desc,
         )
 
+for _tipo, _txt in insights_list:
+    _INSIGHT_FN.get(_tipo, st.info)(_txt)
+
+if recomendacao_txt:
+    st.info(recomendacao_txt, icon="💡")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SEÇÃO 4 — COMPOSTOS PRIORITÁRIOS PARA REVISÃO
+# ═══════════════════════════════════════════════════════════════════════════
 st.divider()
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ZONA 2 — O QUE FAZER
-# ═══════════════════════════════════════════════════════════════════════════
-
-st.subheader("Compostos que exigem atenção")
+st.subheader("Compostos Prioritários para Revisão")
 st.caption(
-    "Todos os compostos do experimento, ordenados por prioridade de revisão. "
-    "🔴 Alta — empate no Rank 1, requer decisão do especialista. "
-    "🟡 Média — baixa confiança de identificação. "
-    "✅ OK — alta confiança."
+    f"{n_revisar} para revisão · {n_compostos} compostos identificados no total"
 )
 
 st.dataframe(
@@ -292,7 +344,6 @@ st.dataframe(
     },
 )
 
-# Expander: candidatos empatados em detalhe
 if n_criticos > 0 and _tem_empate:
     _score_emp_cols = [
         c for c in [
@@ -302,18 +353,18 @@ if n_criticos > 0 and _tem_empate:
         if c in rank1_df.columns
     ]
     _rename_emp = {
-        score_col: "Score",
-        "Score Fragmentacao": "Fragmentação",
-        "Isotope Similarity": "Isótopo",
+        score_col:             "Score",
+        "Score Fragmentacao":  "Fragmentação",
+        "Isotope Similarity":  "Isótopo",
     }
     with st.expander(
-        f"Ver candidatos empatados em detalhe ({n_criticos} composto(s))",
-        expanded=False,
+        f"Candidatos empatados — decisão do especialista necessária ({n_criticos} composto(s))",
+        expanded=True,
     ):
         st.caption(
-            "Candidatos que dividem o Rank 1 para cada composto em empate — "
-            "indistinguíveis pelos critérios automáticos. "
-            "A decisão do candidato definitivo requer avaliação do especialista."
+            "Para cada composto abaixo, compare os espectros no software do instrumento e "
+            "selecione manualmente o candidato correto. "
+            "Os candidatos são indistinguíveis pelos critérios automáticos."
         )
         for _sinal in sorted(_emp_sinais):
             _g = (
@@ -323,16 +374,41 @@ if n_criticos > 0 and _tem_empate:
             st.markdown(f"**{_sinal}**")
             st.dataframe(_g, hide_index=True, use_container_width=True)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SEÇÃO 5 — RELATÓRIOS
+# ═══════════════════════════════════════════════════════════════════════════
 st.divider()
+st.subheader("Relatórios")
+st.caption("Exporte os resultados após revisar os compostos prioritários.")
+
+_col_btn_ra, _col_btn_re, _col_btn_pad = st.columns([1, 1, 2])
+with _col_btn_ra:
+    if st.button(
+        "📊 Relatório Analítico",
+        use_container_width=True,
+        help="Relatório técnico completo — para químicos e especialistas",
+    ):
+        if batch_sel is not None:
+            st.session_state["ir_para_batch"] = batch_sel
+        st.switch_page("pages/5_Relatorios.py")
+with _col_btn_re:
+    if st.button(
+        "📋 Relatório Executivo",
+        use_container_width=True,
+        help="Resumo gerencial — para gestores e reuniões de gestão",
+    ):
+        if batch_sel is not None:
+            st.session_state["ir_para_batch"] = batch_sel
+        st.switch_page("pages/5_Relatorios.py")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ZONA 3 — ANÁLISE DETALHADA (expander fechado por padrão)
+# SEÇÃO 6 — EVIDÊNCIAS TÉCNICAS (expander fechado)
 # ═══════════════════════════════════════════════════════════════════════════
-
-with st.expander("Ver análise detalhada", expanded=False):
+st.divider()
+with st.expander("Evidências técnicas da análise", expanded=False):
 
     # 1 — Mapa de confiança e ambiguidade (scatter)
-    st.markdown("**Mapa de confiança e ambiguidade**")
+    st.subheader("Mapa de confiança e ambiguidade")
     st.caption(
         "Cada ponto é um composto. Eixo horizontal: candidatos moleculares; "
         "eixo vertical: confiança de identificação. "
@@ -390,10 +466,10 @@ with st.expander("Ver análise detalhada", expanded=False):
             use_container_width=True,
         )
 
-    st.markdown("---")
+    st.divider()
 
     # 2 — Histograma de confiança
-    st.markdown("**Confiança de identificação por composto (Rank 1)**")
+    st.subheader("Distribuição dos scores de identificação")
     st.caption(
         "A linha vermelha pontilhada marca 80 — limiar de alta confiança. "
         "Distribuições deslocadas à esquerda indicam experimento com alta ambiguidade geral."
@@ -438,11 +514,10 @@ with st.expander("Ver análise detalhada", expanded=False):
             )
             st.altair_chart((_hist + _l80).properties(height=200), use_container_width=True)
 
-    st.markdown("---")
-
     # 3 — Como as identificações foram resolvidas
     if _tem_criterio and not criterio_counts.empty:
-        st.markdown("**Como as identificações foram resolvidas**")
+        st.divider()
+        st.subheader("Resolução por critério de desempate")
         st.caption(
             "Distribuição dos critérios que determinaram o Rank 1. "
             "Fragmentação MS/MS é o critério de maior prioridade biológica (IST). "
@@ -478,11 +553,10 @@ with st.expander("Ver análise detalhada", expanded=False):
             )
             st.metric("Requerem revisão do especialista", n_nao_resolvidos)
 
-    st.markdown("---")
-
     # 4 — Natureza química dos compostos
     if not classes_classif.empty:
-        st.markdown("**Natureza química dos compostos identificados**")
+        st.divider()
+        st.subheader("Perfil químico dos candidatos Rank 1")
         st.caption("Categorias químicas dos candidatos Rank 1 segundo PubChem / ChEBI.")
         _top = classes_classif.head(10).sort_values("Frequência", ascending=True)
         _bar_cl = (
