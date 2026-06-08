@@ -11,7 +11,7 @@ _ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from src.reports.insights import computar_insights
-from src.reports.pdf_builder import gerar_relatorio_analitico
+from src.reports.pdf_analitico import gerar_relatorio_analitico
 from src.ui.utils import (
     carregar_cobertura_externa,
     carregar_ranking,
