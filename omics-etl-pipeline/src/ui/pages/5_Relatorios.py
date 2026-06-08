@@ -12,6 +12,7 @@ sys.path.insert(0, str(_ROOT))
 
 from src.reports.insights import computar_insights
 from src.reports.pdf_analitico import gerar_relatorio_analitico
+from src.reports.pdf_executivo import gerar_relatorio_executivo
 from src.ui.utils import (
     carregar_cobertura_externa,
     carregar_ranking,
@@ -140,128 +141,173 @@ else:
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Descrição do relatório disponível
+# Seletor de tipo de relatório
 # ---------------------------------------------------------------------------
 st.subheader("Tipo de relatório")
 
-col_tipo, col_desc = st.columns([1, 2])
+_TIPO_RA = "📊 Relatório Analítico"
+_TIPO_RE = "📋 Relatório Executivo"
 
-with col_tipo:
-    with st.container(border=True):
-        st.markdown("### 📊 Relatório Analítico")
-        st.markdown("**Disponível**")
-        st.caption(
-            "Documento completo para revisão técnica e reuniões com o IST. "
-            "Inclui métricas, gráficos, tabela de resultados e nota metodológica."
-        )
+tipo_sel = st.radio(
+    "Selecionar tipo:",
+    options=[_TIPO_RA, _TIPO_RE],
+    horizontal=True,
+    label_visibility="collapsed",
+)
 
-with col_desc:
-    with st.container(border=True):
-        st.markdown("**Conteúdo do relatório:**")
-        st.markdown(
-            "- Resumo do experimento (compostos, candidatos, score médio, empates)  \n"
-            "- Leitura rápida — insights automáticos sobre confiança e ambiguidade  \n"
-            "- Gráfico de discriminabilidade (critérios de desempate IST)  \n"
-            "- Distribuição dos scores de identificação (Rank 1)  \n"
-            "- Perfil químico — classes ChEBI dos candidatos mais prováveis  \n"
-            "- Tabela completa de Rank 1 por composto (ordenada por incerteza)  \n"
-            "- Detalhamento dos compostos em empate (se houver)  \n"
-            "- Nota metodológica e disclaimer de validação"
-        )
-        st.caption(
-            "Formato A4 · Multi-página · Sem interatividade · "
-            "Pronto para impressão ou distribuição digital."
-        )
+col_desc_l, col_desc_r = st.columns(2)
 
-    # Nota sobre o que NÃO está disponível na v1
-    with st.expander("Outros tipos de relatório (em desenvolvimento)"):
-        st.markdown(
-            "**Relatório Executivo** — versão simplificada de 1–2 páginas para gestores, "
-            "sem scores técnicos detalhados. *(v2)*  \n\n"
-            "**Relatório Cross-batch** — comparação entre dois experimentos. *(v2)*  \n\n"
-            "**Lista de Revisão** — PDF com campos para anotação manual pelo especialista. *(v2)*"
-        )
+with col_desc_l:
+    if tipo_sel == _TIPO_RA:
+        with st.container(border=True):
+            st.markdown("**📊 Relatório Analítico**")
+            st.caption("Para químicos, especialistas e reuniões técnicas.")
+            st.markdown(
+                "- Badge de status + diagnóstico automático  \n"
+                "- Tabela de compostos por prioridade de revisão  \n"
+                "- Gráficos de scores e perfil químico  \n"
+                "- Detalhamento de empates e nota metodológica  \n"
+                "- Multi-página · linguagem técnica"
+            )
+    else:
+        with st.container(border=True):
+            st.markdown("**📋 Relatório Executivo**")
+            st.caption("Para gestores, coordenadores e reuniões de gestão.")
+            st.markdown(
+                "- Status da análise em linguagem acessível  \n"
+                "- Números resumidos: compostos, revisão, risco  \n"
+                "- Perfil químico simplificado  \n"
+                "- Recomendação de ação em destaque  \n"
+                "- 1–2 páginas · sem scores técnicos"
+            )
+
+with col_desc_r:
+    st.caption(
+        "Formato A4  ·  Gerado em memória  ·  "
+        "Pronto para impressão ou distribuição digital."
+    )
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Geração do PDF — com persistência de estado para o download_button
+# Geração do PDF — estado persistido por tipo de relatório
 # ---------------------------------------------------------------------------
-_STATE_KEY_BYTES    = "pdf_bytes_v1"
-_STATE_KEY_BATCH    = "pdf_batch_id_v1"
-_STATE_KEY_FILENAME = "pdf_filename_v1"
 
-# Invalida cache se a análise mudou
+_STATE_KEY_BYTES    = "pdf_bytes_ra"
+_STATE_KEY_BATCH    = "pdf_batch_id_ra"
+_STATE_KEY_FILENAME = "pdf_filename_ra"
+_STATE_KEY_BYTES_RE    = "pdf_bytes_re"
+_STATE_KEY_BATCH_RE    = "pdf_batch_id_re"
+_STATE_KEY_FILENAME_RE = "pdf_filename_re"
+
+# Invalida cache quando a análise muda
 if st.session_state.get(_STATE_KEY_BATCH) != batch_id_real:
     st.session_state[_STATE_KEY_BYTES]    = None
     st.session_state[_STATE_KEY_BATCH]    = None
     st.session_state[_STATE_KEY_FILENAME] = None
 
-st.subheader("Gerar relatório")
+if st.session_state.get(_STATE_KEY_BATCH_RE) != batch_id_real:
+    st.session_state[_STATE_KEY_BYTES_RE]    = None
+    st.session_state[_STATE_KEY_BATCH_RE]    = None
+    st.session_state[_STATE_KEY_FILENAME_RE] = None
 
+st.subheader("Gerar relatório")
 col_btn, col_status = st.columns([1, 2])
 
-with col_btn:
-    _gerar = st.button(
-        "📄 Gerar Relatório Analítico",
-        type="primary",
-        use_container_width=True,
-        help="Processa os dados e monta o PDF em memória. Pode levar alguns segundos.",
-    )
+# ── Relatório Analítico ────────────────────────────────────────────────────
+if tipo_sel == _TIPO_RA:
+    with col_btn:
+        _gerar_ra = st.button(
+            "📄 Gerar Relatório Analítico",
+            type="primary",
+            use_container_width=True,
+            help="Monta o PDF analítico completo em memória.",
+        )
 
-if _gerar:
-    with st.spinner("Gerando relatório... isso pode levar alguns segundos."):
-        try:
-            ins           = computar_insights(df)
-            cobertura_ext = carregar_cobertura_externa(batch_id_real) if batch_id_real else {}
-            pdf_bytes     = gerar_relatorio_analitico(ins, batch_info, cobertura_ext)
+    if _gerar_ra:
+        with st.spinner("Gerando Relatório Analítico..."):
+            try:
+                ins           = computar_insights(df)
+                cobertura_ext = carregar_cobertura_externa(batch_id_real) if batch_id_real else {}
+                pdf_bytes     = gerar_relatorio_analitico(ins, batch_info, cobertura_ext)
+                bid_str       = f"batch{batch_id_real}" if batch_id_real else "recente"
+                filename      = f"relatorio_analitico_{bid_str}.pdf"
 
-            bid_str  = f"batch{batch_id_real}" if batch_id_real else "recente"
-            filename = f"relatorio_analitico_{bid_str}.pdf"
+                st.session_state[_STATE_KEY_BYTES]    = pdf_bytes
+                st.session_state[_STATE_KEY_BATCH]    = batch_id_real
+                st.session_state[_STATE_KEY_FILENAME] = filename
+            except Exception as exc:
+                st.error(f"Erro ao gerar o relatório:  \n`{exc}`")
 
-            st.session_state[_STATE_KEY_BYTES]    = pdf_bytes
-            st.session_state[_STATE_KEY_BATCH]    = batch_id_real
-            st.session_state[_STATE_KEY_FILENAME] = filename
+    _pdf_bytes = st.session_state.get(_STATE_KEY_BYTES)
+    _filename  = st.session_state.get(_STATE_KEY_FILENAME, "relatorio_analitico.pdf")
 
-        except Exception as exc:
-            st.error(
-                f"Erro ao gerar o relatório:  \n`{exc}`  \n\n"
-                "Verifique se os dados do experimento estão íntegros e tente novamente."
+    if _pdf_bytes:
+        with col_status:
+            st.success(
+                f"Relatório Analítico gerado — **{len(_pdf_bytes) / 1024:.0f} KB**  \n"
+                "Clique abaixo para baixar."
             )
+        st.download_button(
+            label="⬇ Baixar Relatório Analítico",
+            data=_pdf_bytes,
+            file_name=_filename,
+            mime="application/pdf",
+            type="primary",
+            use_container_width=False,
+        )
+        ins_prev = computar_insights(df)
+        if ins_prev:
+            st.divider()
+            st.markdown("**Conteúdo incluído:**")
+            _c1, _c2, _c3, _c4 = st.columns(4)
+            _c1.metric("Compostos", ins_prev["n_compostos"])
+            _c2.metric("Candidatos", ins_prev["n_candidatos_tot"])
+            _c3.metric("Em empate", ins_prev["n_empates"] if ins_prev["_tem_empate"] else "—")
+            _c4.metric("Score médio", f"{ins_prev['mean_pontuacao']:.1f}")
 
-# Exibe download_button quando o PDF estiver disponível
-_pdf_bytes = st.session_state.get(_STATE_KEY_BYTES)
-_filename  = st.session_state.get(_STATE_KEY_FILENAME, "relatorio.pdf")
-
-if _pdf_bytes:
-    with col_status:
-        st.success(
-            f"Relatório gerado com sucesso — **{len(_pdf_bytes) / 1024:.0f} KB**  \n"
-            "Clique no botão abaixo para baixar."
+# ── Relatório Executivo ────────────────────────────────────────────────────
+else:
+    with col_btn:
+        _gerar_re = st.button(
+            "📋 Gerar Relatório Executivo",
+            type="primary",
+            use_container_width=True,
+            help="Monta o PDF executivo (1–2 páginas) em memória.",
         )
 
-    st.download_button(
-        label="⬇ Baixar PDF",
-        data=_pdf_bytes,
-        file_name=_filename,
-        mime="application/pdf",
-        type="primary",
-        use_container_width=False,
-    )
+    if _gerar_re:
+        with st.spinner("Gerando Relatório Executivo..."):
+            try:
+                ins           = computar_insights(df)
+                cobertura_ext = carregar_cobertura_externa(batch_id_real) if batch_id_real else {}
+                pdf_bytes     = gerar_relatorio_executivo(ins, batch_info, cobertura_ext)
+                bid_str       = f"batch{batch_id_real}" if batch_id_real else "recente"
+                filename      = f"relatorio_executivo_{bid_str}.pdf"
 
-    # Prévia de métricas do relatório gerado
-    ins = computar_insights(df)
-    if ins:
-        st.divider()
-        st.markdown("**Conteúdo incluído no relatório:**")
-        _c1, _c2, _c3, _c4 = st.columns(4)
-        _c1.metric("Compostos", ins["n_compostos"])
-        _c2.metric("Candidatos", ins["n_candidatos_tot"])
-        _c3.metric(
-            "Em empate",
-            ins["n_empates"] if ins["_tem_empate"] else "—",
+                st.session_state[_STATE_KEY_BYTES_RE]    = pdf_bytes
+                st.session_state[_STATE_KEY_BATCH_RE]    = batch_id_real
+                st.session_state[_STATE_KEY_FILENAME_RE] = filename
+            except Exception as exc:
+                st.error(f"Erro ao gerar o relatório:  \n`{exc}`")
+
+    _pdf_bytes_re = st.session_state.get(_STATE_KEY_BYTES_RE)
+    _filename_re  = st.session_state.get(_STATE_KEY_FILENAME_RE, "relatorio_executivo.pdf")
+
+    if _pdf_bytes_re:
+        with col_status:
+            st.success(
+                f"Relatório Executivo gerado — **{len(_pdf_bytes_re) / 1024:.0f} KB**  \n"
+                "Clique abaixo para baixar."
+            )
+        st.download_button(
+            label="⬇ Baixar Relatório Executivo",
+            data=_pdf_bytes_re,
+            file_name=_filename_re,
+            mime="application/pdf",
+            type="primary",
+            use_container_width=False,
         )
-        _c4.metric("Score médio Rank 1", f"{ins['mean_pontuacao']:.1f}")
 
 # ---------------------------------------------------------------------------
 # Rodapé
